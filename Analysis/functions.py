@@ -66,8 +66,10 @@ def outliersInDf(df, xCol,yCol, std = 1.5):
         
         
 # graph box graphs
-def BoxGraphMulti(df: pd.DataFrame, xCol, yCol, compCol, orderList):    
-    
+defaultOrderList = ['1','2','3','4','5','6','7','8','9','10',
+                '11','12','13','14','15','16','17','18','19','20','21','22','X','Y']
+
+def BoxGraphMulti(df: pd.DataFrame, xCol, yCol, compCol, orderList=defaultOrderList):   
     ax = sns.boxplot(data=df, x=xCol, y=yCol, hue=compCol, medianprops={"linewidth": 4, 'color':'black'}, showfliers=True)
     ax.set_xticklabels(ax.get_xticklabels(), rotation = 45, ha="right")
     
@@ -389,7 +391,7 @@ def rmsType(row):
         return 'ERMS'
     return row['type']
 
-#getting df into usable format
+#getting df into usable format, making the list that goes in a df
 def makeDataSet(identifiers, series: pd.Series, secondIndex: str)->list:
     dataList = []
     for i in identifiers:
@@ -400,7 +402,8 @@ def makeDataSet(identifiers, series: pd.Series, secondIndex: str)->list:
             dataList.append(0)
 
     return(dataList)
- 
+
+
 def makeUnequalDF(list1: list, list2: list) -> pd.DataFrame: #only for kics vs lfs D:
     tempDict = dict(kics = list1, lfs = list2)
     df = pd.DataFrame(dict([(k, pd.Series(v)) for k,v in tempDict.items()]))
@@ -436,3 +439,23 @@ def formatDataFrame(df: pd.DataFrame, groupByList: list, normalizeList: list,
         dfReg = pd.concat([dfReg, series], axis=0) 
     
     return(dfReg, dfNorm)
+
+
+#plot boxplot graphs
+def createBoxplot(newKdf,normKdf,newLdf,normLdf):
+    newKdf['dataset'] = 'kics'
+    newLdf['dataset'] = 'lfs'
+    normKdf['dataset'] = 'kics'
+    normLdf['dataset'] = 'lfs'
+
+    newMergedDf = pd.concat([newKdf, newLdf])
+    newMergedDf.rename(columns = {0:'occ'}, inplace = True)
+    newMergedDf.reset_index(inplace=True)
+    newMergedDf.rename(columns = {'index':'chrom'}, inplace = True)
+    
+    BoxGraphMulti(newMergedDf, 'chrom', 'occ', 'dataset')
+
+    normMergedDf = pd.concat([normKdf, normLdf])
+    normMergedDf.reset_index(inplace=True)
+
+    BoxGraphMulti(normMergedDf, 'chrom', 'normalized', 'dataset')
