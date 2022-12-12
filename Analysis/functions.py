@@ -205,15 +205,16 @@ def kIdAbbv(clinicDf, svDf, clinicCol, svCol):
                          how='inner')
     except:
         try:
-            print('try2')
             df = pd.merge(svDf[[svCol,'SV type','abbv_id']],                 
                          clinicDf,
                          left_on = 'abbv_id', 
                          right_on = 'abbv_id', 
                          how='inner')
         except:
-            print('not good')
-            df = pd.DataFrame()
+            try:
+                df = pd.merge(svDf,clinicDf, left_on ='abbv_id', right_on = 'abbv_id', how='inner')
+            except:
+                df = pd.DataFrame()
     
     return df
 
@@ -459,3 +460,6 @@ def createBoxplot(newKdf,normKdf,newLdf,normLdf):
     normMergedDf.reset_index(inplace=True)
 
     BoxGraphMulti(normMergedDf, 'chrom', 'normalized', 'dataset')
+    
+    
+  
