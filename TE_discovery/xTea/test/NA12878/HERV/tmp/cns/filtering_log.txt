@@ -1,0 +1,33 @@
+[Log starts:]
+[Filtering:collect_clipped_disc_reads:Starts...]
+
+[Filtering:collect_clipped_disc_reads:Finished]
+
+[Filtering:realign_clipped_read_with_polyA:Starts...]
+
+[Filtering:realign_clipped_read_with_polyA:Finished]
+
+[Filtering:realign_disc_reads:Starts...]
+
+[Filtering:realign_disc_reads:Finished...]
+
+[Filtering:Clip-Consistency-Checking:Starts...]
+
+[Filtering:Clip-Consistency-Checking:Finished...]
+
+[Filtering:Disc-Consistency-Checking:Starts...]
+
+[Filtering:Disc-Consistency-Checking: m_disc_consist_list size is 0]
+
+[Filtering:Disc-Consistency-Checking:Finished...]
+
+[Filtering:calc_coverage_samples:Starts...]
+
+[Filtering:calc_coverage_samples:Finished with estimated coverage:0]
+
+[Filtering:Filter-Dump-Insertion-Info:Starts...]
+
+[extension length is: 851]
+
+[Filtering:Filter-Dump-Insertion-Info:Finished...]
+

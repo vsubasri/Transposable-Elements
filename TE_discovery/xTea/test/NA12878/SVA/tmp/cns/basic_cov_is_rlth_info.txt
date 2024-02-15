@@ -1,0 +1,1 @@
+/hpf/largeprojects/davidm/vsubasri/transposable_elements/xTea/test/NA12878_20k.b37.bam	0	0	443.46875	156.8020217453764

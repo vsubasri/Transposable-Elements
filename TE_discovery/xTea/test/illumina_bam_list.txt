@@ -1,0 +1,1 @@
+NA12878 /hpf/largeprojects/davidm/vsubasri/transposable_elements/xTea/test/NA12878_20k.b37.bam
