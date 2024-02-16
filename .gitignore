@@ -1,3 +1,9 @@
+data/
+logs/
+.DS_Store
+.snakemake
+*.out
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
