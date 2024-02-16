@@ -8,12 +8,11 @@
 #SBATCH --mail-type=ALL
 
 SF=Snakefile
-CP="/home/vsubasri/.conda/"
-SLURM=~/slurm_profile/
+CP="/hpf/largeprojects/davidm/resources/snakemake"
 CONFIG=config.yaml
 
-source ~/anaconda3/etc/profile.d/conda.sh
+source /hpf/largeprojects/davidm/resources/etc/profile.d/conda.sh
+conda activate snakemake
 
-module load miniconda/4.4.10 snakemake/20230426
+snakemake --use-conda -s ${SF} --cores 4 --conda-prefix ${CP} --configfile ${CONFIG} --printshellcmds
 
-snakemake --use-conda -s ${SF} --cores 4 --conda-prefix ${CP} --configfile ${CONFIG} --profile ${SLURM} --printshellcmds

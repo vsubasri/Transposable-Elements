@@ -4,7 +4,7 @@ run:
   MELT: "/hpf/largeprojects/davidm/vsubasri/transposable_elements/Transposable-Elements/TE_discovery/MELT/MELTv2.2.2/MELT.jar"
   genome_ref: "/hpf/largeprojects/davidm/resources/Homo_sapiens.GRCh37.75.dna_rm.primary_assembly.fa"
   element_ref: "/hpf/largeprojects/davidm/vsubasri/transposable_elements/Transposable-Elements/TE_discovery/MELT/transposon_file_list.txt"
-  snpeff: "/hpf/largeprojects/ccmbio/naumenko/tools/bcbio/anaconda/bin/snpEff"
+  snpeff: "/hpf/largeprojects/davidm/resources/snpEff"
   snpeff_data: "/hpf/largeprojects/ccmbio/naumenko/tools/bcbio/genomes/Hsapiens/GRCh37/snpeff"
   
   protein_coding_genes: "/hpf/largeprojects/ccm_dccforge/dccdipg/Common/annotation/grch37.p13.ensembl.sorted.protein.coding.genes.bed"
