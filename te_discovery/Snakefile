@@ -18,7 +18,7 @@ rule all:
 
 rule Preprocess:
     input:                        
-        bam = "data/{project}/{project}_{sample}.bam"
+        bam = "data/{project}/{sample}.bam"
     output: 
         disc = temp("data/{project}/{project}_{sample}.bam.disc"),
         bai = temp("data/{project}/{project}_{sample}.bam.disc.bai"),
@@ -38,10 +38,10 @@ rule Preprocess:
 
 rule IndivAnalysis:
     input: 
-        bam = [expand("data/{project}/{project}_{sample}.bam".format(project=project, sample=s)) for s in samples.index],
-        disc = [expand("data/{project}/{project}_{sample}.bam.disc".format(project=project, sample=s)) for s in samples.index],
-        bai = [expand("data/{project}/{project}_{sample}.bam.disc.bai".format(project=project, sample=s)) for s in samples.index],
-        fq = [expand("data/{project}/{project}_{sample}.bam.fq".format(project=project, sample=s)) for s in samples.index]
+        bam = [expand("data/{project}/{sample}.bam".format(project=project, sample=s)) for s in samples.index],
+        disc = [expand("data/{project}/{sample}.bam.disc".format(project=project, sample=s)) for s in samples.index],
+        bai = [expand("data/{project}/{sample}.bam.disc.bai".format(project=project, sample=s)) for s in samples.index],
+        fq = [expand("data/{project}/{sample}.bam.fq".format(project=project, sample=s)) for s in samples.index]
     output: 
         indiv_dir = temp(directory("data/{project}/IndivAnalysis_out/"))
         # final_bam_ALU = "data/{project}/IndivAnalysis_out/{project}_{sample}.ALU.aligned.final.sorted.bam",
