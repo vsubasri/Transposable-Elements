@@ -278,7 +278,6 @@ rule MELT_report:
     params:
         project = project,
         protein_coding_genes = config["run"]["protein_coding_genes"],
-        hgmd_db = config["run"]["hgmd_db"],
         exon_bed = config["run"]["exon_bed"],
         #exac = config["run"]["exac"],
         omim = config["run"]["omim"],
