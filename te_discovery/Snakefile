@@ -280,7 +280,7 @@ rule MELT_report:
         protein_coding_genes = config["run"]["protein_coding_genes"],
         hgmd_db = config["run"]["hgmd_db"],
         exon_bed = config["run"]["exon_bed"],
-        exac = config["run"]["exac"],
+        #exac = config["run"]["exac"],
         omim = config["run"]["omim"],
         gnomad = config["run"]["gnomad"],
         biomart = config["run"]["biomart"],

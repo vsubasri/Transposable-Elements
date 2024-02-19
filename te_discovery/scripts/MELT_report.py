@@ -316,10 +316,10 @@ def main():
         lambda gene_list: [gene for gene in gene_list if gene in protein_coding_ENSG]
     )
 
-    print("Annotating structural variants against genes, hgmd, hpo, exac, and omim")
+    print("Annotating structural variants against genes, hgmd, hpo, and omim")
     HPO_cols = ["N_UNIQUE_HPO_TERMS", "HPO Features", "N_GENES_IN_HPO", "Genes in HPO"]
     ann_records = SVAnnotator(snakemake.params.exon_bed, snakemake.params.hgmd_db, 
-                              snakemake.params.hpo, snakemake.params.exac, 
+                              snakemake.params.hpo, 
                               snakemake.params.omim, snakemake.params.biomart)
     df = ann_records.annotate_genes(df, Protein_coding_genes_col)
 

@@ -22,7 +22,7 @@ class SVTYPE(Enum):
 
 
 class SVAnnotator:
-    def __init__(self, exon_bed, hgmd_db, hpo, exac, omim, biomart):
+    def __init__(self, exon_bed, hgmd_db, hpo, omim, biomart):
 
         self.make_gene_ref_df(biomart)
 
@@ -36,8 +36,6 @@ class SVAnnotator:
 
         print("Annotating genes with OMIM phenotypes and inheritance patterns")
         self.annotate_omim(omim)
-        print("Annotating genes with ExAC transcript probabilities")
-        self.annotate_exac(exac)
 
         # technical note: drop duplicates before setting index - doing the reverse order will drop all duplicated columns instead of keeping one copy
         self.gene_ref_df = (
@@ -437,26 +435,6 @@ class SVAnnotator:
             self.gene_ref_df, omim_df, matching_fields
         )
         # self.gene_ref_df.to_csv("omim_ann.tsv", sep="\t")
-
-    def annotate_exac(self, exac):
-        matching_fields = {
-            "ExAC gene": "BioMart Associated Gene Name",
-        }
-
-        exac_df = pd.read_csv(exac, sep="\t")
-        exac_df.columns = exac_df.columns.str.strip()
-        exac_df["transcript"] = exac_df["transcript"].apply(
-            lambda transcript_id: transcript_id.split(".")[0]
-        )
-        exac_df = exac_df[["gene", "syn_z", "mis_z", "lof_z", "pLI"]]
-
-        exac_df = exac_df.astype(str)
-        self.append_prefix_to_columns(exac_df, "ExAC")
-
-        self.gene_ref_df = self.prioritized_annotation(
-            self.gene_ref_df, exac_df, matching_fields
-        )
-        # self.gene_ref_df.to_csv("exac_ann.tsv", sep="\t")
 
     def annotate_gnomad(self, gnomad, sv_record, reciprocal_overlap=0.5):
         print(
