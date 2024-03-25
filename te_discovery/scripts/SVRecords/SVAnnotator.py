@@ -22,7 +22,7 @@ class SVTYPE(Enum):
 
 
 class SVAnnotator:
-    def __init__(self, exon_bed, hgmd_db, hpo, exac, omim, biomart):
+    def __init__(self, exon_bed, , hpo, omim, biomart):
 
         self.make_gene_ref_df(biomart)
 
@@ -36,8 +36,6 @@ class SVAnnotator:
 
         print("Annotating genes with OMIM phenotypes and inheritance patterns")
         self.annotate_omim(omim)
-        print("Annotating genes with ExAC transcript probabilities")
-        self.annotate_exac(exac)
 
         # technical note: drop duplicates before setting index - doing the reverse order will drop all duplicated columns instead of keeping one copy
         self.gene_ref_df = (
@@ -192,90 +190,6 @@ class SVAnnotator:
         min_boundary = distance[min_distance]
         gene = boundaries[boundaries["value"] == min_boundary]["GENE"].values[0]
         return min_distance, min_boundary, gene
-
-    def annotate_hgmd(self, hgmd, sv_record):
-        print(
-            "Annotating genes with published cases of pathogenic structural variants from HGMD"
-        )
-
-        def get_hgmd_df():
-            conn = sqlite3.connect(hgmd)
-
-            gros_del = pd.read_sql_query(
-                """
-                SELECT del.DISEASE, del.TAG, del.DESCR, del.gene,
-                printf('%s:%s:%s:%s', del.JOURNAL, del.AUTHOR, del.YEAR, del.PMID) AS JOURNAL_DETAILS,
-                ALLGENES.HGNCID
-                FROM GROSDEL as del 
-                LEFT JOIN ALLGENES ON ALLGENES.GENE=del.GENE;
-            """,
-                conn,
-            )
-
-            gros_ins = pd.read_sql_query(
-                """
-                SELECT ins.DISEASE, ins.TAG, ins.DESCR, ins.gene, 
-                printf('%s:%s:%s:%s', ins.JOURNAL, ins.AUTHOR, ins.YEAR, ins.PMID) AS JOURNAL_DETAILS,
-                ALLGENES.HGNCID
-                FROM GROSINS as ins 
-                LEFT JOIN ALLGENES ON ALLGENES.GENE=ins.GENE
-                WHERE ins.type='I';
-            """,
-                conn,
-            )
-
-            gros_dup = pd.read_sql_query(
-                """
-                SELECT ins.DISEASE, ins.TAG, ins.DESCR, ins.gene, 
-                printf('%s:%s:%s:%s', ins.JOURNAL, ins.AUTHOR, ins.YEAR, ins.PMID) AS JOURNAL_DETAILS,
-                ALLGENES.HGNCID
-                FROM GROSINS as ins 
-                LEFT JOIN ALLGENES ON ALLGENES.GENE=ins.GENE
-                WHERE ins.type='D';
-            """,
-                conn,
-            )
-
-            conn.close()
-
-            return gros_del, gros_ins, gros_dup
-
-        def groupby_genes(df):
-            df["hgncID"] = df["hgncID"].astype(str)
-            # df['omimid'] = df['omimid'].astype(str)
-            # df['gene'] = self.gene2hgnc(df['gene'])
-            df = df.groupby(by="gene", as_index=False).agg(
-                lambda x: "%s" % " & ".join(x)
-            )
-            df["hgncID"] = df["hgncID"].apply(lambda col: col.split(", ")[0])
-            # df['omimid'] = df['omimid'].apply(lambda col: col.split(', ')[0])
-            return df
-
-        hgmd_sv_df = pd.DataFrame()
-        gros_del, gros_ins, gros_dup = get_hgmd_df()
-
-        gros_del = groupby_genes(gros_del)
-        gros_ins = groupby_genes(gros_ins)
-        gros_dup = groupby_genes(gros_dup)
-
-        for df in [gros_del, gros_ins, gros_dup]:
-            df["gene"] = df["gene"].apply(lambda symbol: symbol.upper())
-            self.append_prefix_to_columns(df, "HGMD")
-
-        gros_del["HGMD SVTYPE"] = SVTYPE.DEL.value
-        gros_ins["HGMD SVTYPE"] = SVTYPE.INS.value
-        gros_dup["HGMD SVTYPE"] = SVTYPE.DUP.value
-
-        # hgmd_sv_df = hgmd_sv_df.rename(columns={'HGMD gene': 'Genes in HGMD'})
-        hgmd_sv_df = pd.concat(
-            [gros_del, gros_ins, gros_dup], ignore_index=True, sort=False
-        )
-        hgmd_sv_df["Genes in HGMD"] = hgmd_sv_df["HGMD gene"]
-        hgmd_sv_df = hgmd_sv_df.set_index(keys=["HGMD gene", "HGMD SVTYPE"]).astype(str)
-
-        return sv_record.join(
-            hgmd_sv_df, on=["BioMart Associated Gene Name", "SVTYPE"], how="left"
-        )
 
     def prioritized_annotation(self, gene_ref_df, annotation_df, matched_fields):
         matched_rows = []
@@ -437,26 +351,6 @@ class SVAnnotator:
             self.gene_ref_df, omim_df, matching_fields
         )
         # self.gene_ref_df.to_csv("omim_ann.tsv", sep="\t")
-
-    def annotate_exac(self, exac):
-        matching_fields = {
-            "ExAC gene": "BioMart Associated Gene Name",
-        }
-
-        exac_df = pd.read_csv(exac, sep="\t")
-        exac_df.columns = exac_df.columns.str.strip()
-        exac_df["transcript"] = exac_df["transcript"].apply(
-            lambda transcript_id: transcript_id.split(".")[0]
-        )
-        exac_df = exac_df[["gene", "syn_z", "mis_z", "lof_z", "pLI"]]
-
-        exac_df = exac_df.astype(str)
-        self.append_prefix_to_columns(exac_df, "ExAC")
-
-        self.gene_ref_df = self.prioritized_annotation(
-            self.gene_ref_df, exac_df, matching_fields
-        )
-        # self.gene_ref_df.to_csv("exac_ann.tsv", sep="\t")
 
     def annotate_gnomad(self, gnomad, sv_record, reciprocal_overlap=0.5):
         print(
