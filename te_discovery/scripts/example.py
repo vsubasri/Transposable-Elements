@@ -22,9 +22,7 @@ def filter_report(svreport):
 def main(
     protein_coding_genes,
     exon_bed,
-    hgmd_db,
     hpo,
-    exac,
     omim,
     biomart,
     gnomad,
@@ -139,13 +137,6 @@ def main(
             "DDD_mode",
             "DDD_pmids",
             "Genes in HGMD",
-            "HGMD disease",
-            "HGMD descr",
-            "HGMD JOURNAL_DETAILS",
-            "ExAC syn_z",
-            "ExAC mis_z",
-            "ExAC lof_z",
-            "ExAC pLI",
         ]
         + [col for col in SVScore_cols if col != "variants/SVLEN"]
         + [
@@ -277,9 +268,7 @@ if __name__ == "__main__":
     main(
         snakemake.params.protein_coding_genes,
         snakemake.params.exon_bed,
-        snakemake.params.hgmd,
         snakemake.params.hpo,
-        snakemake.params.exac,
         snakemake.params.omim,
         snakemake.params.biomart,
         snakemake.params.gnomad,
