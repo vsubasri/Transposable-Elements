@@ -1,6 +1,8 @@
 run:
-  data: "/hpf/largeprojects/davidm/blaverty/te/data"
-  project: "test"
+
+  data: "/hpf/largeprojects/davidm/data"
+  project: "te_test"
+
   samples: samples.tsv
   MELT: "/hpf/largeprojects/davidm/vsubasri/transposable_elements/Transposable-Elements/TE_discovery/MELT/MELTv2.2.2/MELT.jar"
   genome_ref: "/hpf/largeprojects/davidm/resources/Homo_sapiens.GRCh37.75.dna_rm.primary_assembly.fa"
