@@ -1,4 +1,5 @@
 run:
+  data: "/hpf/largeprojects/davidm/blaverty/te/data"
   project: "test"
   samples: samples.tsv
   MELT: "/hpf/largeprojects/davidm/vsubasri/transposable_elements/Transposable-Elements/TE_discovery/MELT/MELTv2.2.2/MELT.jar"
@@ -7,13 +8,13 @@ run:
   snpeff: "/hpf/largeprojects/davidm/resources/snpEff"
   snpeff_data: "/hpf/largeprojects/davidm/resources/snpEff/data"
   
-  protein_coding_genes: "/hpf/largeprojects/ccm_dccforge/dccdipg/Common/annotation/grch37.p13.ensembl.sorted.protein.coding.genes.bed"
-  exon_bed: "/hpf/largeprojects/ccm_dccforge/dccdipg/Common/annotation/exons/hg19_UCSC_exons_canonical.bed"
-  omim: "/hpf/largeprojects/ccm_dccforge/dccdipg/Common/annotation/OMIM_2020-04-09/genemap2.txt" # applied
-  gnomad: "/hpf/largeprojects/davidm/resources/gnomad_v2/gnomad_v2_sv.sites.bed"
-  biomart: "/hpf/largeprojects/ccm_dccforge/dccdipg/Common/annotation/BioMaRt.GrCh37.75.ensembl.mim.hgnc.entrez.txt"
-  mssng_manta_counts: "/hpf/largeprojects/ccm_dccforge/dccdipg/Common/annotation/MSSNG_COUNTS/Canadian_MSSNG_parent_SVs.Manta.counts.txt"
-  hpo_dir: "/hpf/largeprojects/ccmbio/dennis.kao/gene_data/HPO/"########
+  protein_coding_genes: "/hpf/largeprojects/davidm/resources/MELT_anno/grch37.p13.ensembl.sorted.protein.coding.genes.bed"
+  exon_bed: "/hpf/largeprojects/davidm/resources/MELT_anno/hg19_UCSC_exons_canonical.bed"
+  omim: "/hpf/largeprojects/davidm/resources/MELT_anno/genemap2.txt" #2020-04-09 
+  gnomad: "/hpf/largeprojects/davidm/resources/MELT_anno/gnomad_v2_sv.sites.bed"
+  biomart: "/hpf/largeprojects/davidm/resources/MELT_anno/BioMaRt.GrCh37.75.ensembl.mim.hgnc.entrez.txt"
+  mssng_manta_counts: "/hpf/largeprojects/davidm/resources/MELT_anno/Canadian_MSSNG_parent_SVs.Manta.counts.txt"
+  hpo_dir: "/hpf/largeprojects/davidm/resources/MELT_anno/phenotype.hpoa"
   sv_counts: [mssng_manta_counts]
 
 
