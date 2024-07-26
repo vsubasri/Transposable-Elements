@@ -1,3 +1,0 @@
-bash run_gnrt_pipeline_case_ctrl_hg19.sh
-bash interm_set_prep_sbatch.sh
-bash submit_scripts.sh
