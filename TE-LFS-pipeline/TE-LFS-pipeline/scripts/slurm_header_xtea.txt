@@ -1,0 +1,12 @@
+#!/bin/bash
+
+#SBATCH -J xtea_runs
+#SBATCH -e %x.e%j
+#SBATCH -o %x.o%j
+#SBATCH -N 1 -c 16
+#SBATCH --mem=64G
+#SBATCH -t 90:00:00
+
+source ~/xtea_env/bin/activate
+module load samtools/1.10 bwa/0.7.17
+
