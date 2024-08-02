@@ -14,6 +14,7 @@ melt_full_path="/hpf/largeprojects/davidm/shilpa/TE-tools/MELTv2.2.2"
 
 bamfilepath=$1
 wfolder=$2
+reference_fasta="/hpf/largeprojects/davidm/resources/hs37d5.fa"
 
 bam=$(basename "$bamfilepath")
 
@@ -23,7 +24,7 @@ bam=$(basename "$bamfilepath")
 java -jar $melt_full_path/MELT.jar Single \
     -a \
     -b hs37d5/NC_007605 \
-    -h $melt_full_path/Demo/hs37d5.fa \
+    -h $reference_fasta \
     -bamfile $bamfilepath \
     -n $melt_full_path/add_bed_files/1KGP_Hg19/hg19.genes.bed \
     -t $melt_full_path/mei_list.txt \

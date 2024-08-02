@@ -4,7 +4,7 @@
 #SBATCH -o logs/%x_output_%j.log
 #SBATCH -e logs/%x_error_%j.log
 #SBATCH -N 1 -c 16
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH -t 24:00:00
 
 bamfilepath=$1
@@ -15,11 +15,11 @@ if [ ! -f "$bamfilepath" ]; then
 fi
 
 module load java/1.8.0_91 bowtie2 samtools
-picardpath = "/hpf/largeprojects/davidm/shilpa/TE-tools/picard.jar"
+picardpath="/hpf/largeprojects/davidm/shilpa/TE-tools/picard.jar"
 reference_fasta="/hpf/largeprojects/davidm/shilpa/TE-tools/MELTv2.2.2/Demo/hs37d5.fa"
 
-output_dir="$PWD/fixed_bams"
-mkdir -p "$output_dir"
+output_dir=$PWD
+#mkdir -p "$output_dir"
 
 bam=$(basename "$bamfilepath")
 
@@ -46,12 +46,26 @@ else
 fi
 
 # coverage metrics
-$picardpath CollectWgsMetrics I="$sorted_fixed" O="${output_dir}/${bam}_wgs_metrics.txt" R="$reference_fasta"
+java -jar $picardpath CollectWgsMetrics I="$sorted_fixed" O="${output_dir}/${bam}_wgs_metrics.txt" R="$reference_fasta"
 
 # alignment summary metrics
-$picardpath CollectAlignmentSummaryMetrics I="$sorted_fixed" O="${output_dir}/${bam}_alignment_metrics.txt" R="$reference_fasta"
+java -jar $picardpath CollectAlignmentSummaryMetrics I="$sorted_fixed" O="${output_dir}/${bam}_alignment_metrics.txt" R="$reference_fasta"
 
 # Calculate base quality statistics using samtools stats
 samtools stats "${sorted_fixed}" > "${output_dir}/${bam}_bamfilestats.txt"
+
+combined_metrics="${output_dir}/${bam}_combined_metrics.txt"
+{
+echo "Coverage Metrics:"
+cat "${output_dir}/${bam}_wgs_metrics.txt"
+echo ""
+echo "Alignment Summary:"
+cat "${output_dir}/${bam}_alignment_metrics.txt"
+echo ""
+echo "Base quality Stat:"
+cat "${output_dir}/${bam}_bamfilestats.txt"
+} > $combined_metrics
+
+rm "${output_dir}/${bam}_wgs_metrics.txt" "${output_dir}/${bam}_alignment_metrics.txt" "${output_dir}/${bam}_bamfilestats.txt"
 
 echo "Preprocessing and metrics calculation completed for: $bamfilepath"

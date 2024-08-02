@@ -3,7 +3,7 @@
 SAMPLE_ID=sample_id.txt
 BAMS=bamfile_desc.txt
 X10_BAM=null
-WFOLDER=$PWD/xtea-runs
+WFOLDER=$PWD
 OUT_SCRTP=submit_scripts.sh
 TIME=0-05:00
 REP_LIB=/hpf/largeprojects/davidm/shilpa/TE-tools/xTea-new/xTea/rep_lib_annotation
