@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH -J xtea_runs
-#SBATCH -e %x.e%j
-#SBATCH -o %x.o%j
+#SBATCH -o logs/%x_output_%j.log
+#SBATCH -e logs/%x_error_%j.log
 #SBATCH -N 1 -c 16
 #SBATCH --mem=64G
 #SBATCH -t 90:00:00
