@@ -22,7 +22,7 @@ bam=$(basename "$bamfilepath")
 
 # Run MELT with Single mode
 java -jar $melt_full_path/MELT.jar Single \
-    -a \
+    -ac \
     -b hs37d5/NC_007605 \
     -h $reference_fasta \
     -bamfile $bamfilepath \
