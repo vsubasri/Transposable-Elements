@@ -16,7 +16,7 @@ fi
 
 module load java/1.8.0_91 bowtie2 samtools
 picardpath="/hpf/largeprojects/davidm/shilpa/TE-tools/picard.jar"
-reference_fasta="/hpf/largeprojects/davidm/resources/hs37d5.fa"
+reference_fasta="/hpf/largeprojects/davidm/resources/GRCh38.primary_assembly.genome.fa"
 
 output_dir=$PWD
 #mkdir -p "$output_dir"
