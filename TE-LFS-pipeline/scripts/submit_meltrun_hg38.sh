@@ -14,19 +14,19 @@ melt_full_path="/hpf/largeprojects/davidm/shilpa/TE-tools/MELTv2.2.2"
 
 bamfilepath=$1
 wfolder=$2
-reference_fasta="/hpf/largeprojects/davidm/resources/hs37d5.fa"
+#reference_fasta="/hpf/largeprojects/davidm/resources/hs37d5.fa"
+reference_fasta="/hpf/largeprojects/davidm/resources/GRCh38.primary_assembly.genome.fa"
 
 bam=$(basename "$bamfilepath")
 
-#ls $melt_full_path/me_refs/1KGP_Hg19/*.zip > mei_list.txt #need to be done only once
+ls $melt_full_path/me_refs/Hg38/*.zip > mei_list_hg38.txt #need to be done only once
 
 # Run MELT with Single mode
 java -jar $melt_full_path/MELT.jar Single \
     -ac \
-    -b hs37d5/NC_007605 \
     -h $reference_fasta \
     -bamfile $bamfilepath \
-    -n $melt_full_path/add_bed_files/1KGP_Hg19/hg19.genes.bed \
-    -t $melt_full_path/mei_list.txt \
+    -n $melt_full_path/add_bed_files/Hg38/Hg38.genes.bed \
+    -t $melt_full_path/mei_list_hg38.txt \
     -w $wfolder
 

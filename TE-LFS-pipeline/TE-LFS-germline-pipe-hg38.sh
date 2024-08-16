@@ -9,13 +9,13 @@
 #########################################
 
 # Define the directory containing BAM files
-BAM_DIR="${1:-/hpf/largeprojects/davidm/data/te_test/germline_bam/}"
-# default BAM_DIR is also in case
+BAM_DIR="${1:-/hpf/largeprojects/davidm/data/te_test/germline_bam_hg38/}"
+# default BAM_DIR is mentioned in case (this this currently does not have hg38 data)
 
 # output directories
 TEPIPE_DIR="/hpf/largeprojects/davidm/shilpa/TE-LFS-pipeline"
-OUTPUT_DIR=$PWD/results
-BAM_fixed=$PWD/fixed_bams
+OUTPUT_DIR=$PWD/results_hg38
+BAM_fixed=$PWD/fixed_bams_hg38
 XTEA_DIR=$OUTPUT_DIR/xtea_runs
 MELT_DIR=$OUTPUT_DIR/melt_runs
 INS_DIR=$OUTPUT_DIR/ins_runs
@@ -30,18 +30,18 @@ ls $BAM_DIR/*.bam > rawbamfilepaths.txt
 #########################################
 # Step 1: File Preprocessing
 #########################################
-cp rawbamfilepaths.txt $TEPIPE_DIR/scripts/submit_preprocessbam.sh $TEPIPE_DIR/scripts/process_metrics.sh $BAM_fixed
+cp rawbamfilepaths.txt $TEPIPE_DIR/scripts/submit_preprocessbam_hg38.sh $TEPIPE_DIR/scripts/process_metrics.sh $BAM_fixed
 (
 cd $BAM_fixed || exit
 while read -r bamfilepath; do
-    sbatch submit_preprocessbam.sh "$bamfilepath"
+    sbatch submit_preprocessbam_hg38.sh "$bamfilepath"
 done < rawbamfilepaths.txt
 )
 # Wait for preprocessing to complete
-while squeue -u $USER | grep -q 'bam_preprocess'; do
-    echo "**waiting for the bam preprocessing steps ..."
-    sleep 1000
-done
+#while squeue -u $USER | grep -q 'bam_preprocess'; do
+#    echo "**waiting for the bam preprocessing steps ..."
+#    sleep 1000
+#done
 #########################################
 
 ls $BAM_fixed/sorted_fixed_*_N.bam > bamfilepaths.txt
@@ -51,11 +51,11 @@ awk '{print $1}' bamfile_desc.txt >sample_id.txt
 #########################################
 # Step 2: xTea
 #########################################
-
-cp bamfile_desc.txt sample_id.txt $TEPIPE_DIR/scripts/run_gnrt_pipeline_hg19.sh $TEPIPE_DIR/scripts/run_gnrt_pipeline_hg19_hs37.sh $TEPIPE_DIR/scripts/interm_set_prep_sbatch.sh $TEPIPE_DIR/scripts/slurm_header_xtea.txt $XTEA_DIR
+#
+cp bamfile_desc.txt sample_id.txt $TEPIPE_DIR/scripts/run_gnrt_pipeline_hg38.sh $TEPIPE_DIR/scripts/interm_set_prep_sbatch.sh $TEPIPE_DIR/scripts/slurm_header_xtea.txt $XTEA_DIR
 (
 cd $XTEA_DIR || exit
-	bash run_gnrt_pipeline_hg19.sh
+	bash run_gnrt_pipeline_hg38.sh
 	#prepating files for slurm job
 	bash interm_set_prep_sbatch.sh
 	bash submit_scripts.sh
@@ -71,9 +71,9 @@ process_melt() {
     local sample_id=$(basename "$bamfilepath" | awk -F"." '{print $1}')
     local sample_output_dir=$MELT_DIR/$sample_id
     mkdir -p $sample_output_dir
-    sbatch submit_meltrun.sh "$bamfilepath" "$sample_output_dir"
+    sbatch submit_meltrun_hg38.sh "$bamfilepath" "$sample_output_dir"
 }
-cp $TEPIPE_DIR/scripts/submit_meltrun.sh bamfilepaths.txt $MELT_DIR
+cp $TEPIPE_DIR/scripts/submit_meltrun_hg38.sh bamfilepaths.txt $MELT_DIR
 
 (
 cd $MELT_DIR || exit
@@ -87,14 +87,15 @@ echo "Melt runs submitted"
 ##########################################
 # Step 4: INSurVeyor
 ##########################################
+
 process_ins() {
     local bamfilepath=$1
     local sample_id=$(basename "$bamfilepath" | awk -F"." '{print $1}')
     local sample_output_dir=$INS_DIR/$sample_id
     mkdir -p $sample_output_dir
-    sbatch submit_singu_run_insurveyor.sh "$bamfilepath" "$sample_output_dir"
+    sbatch submit_singu_run_insurveyor_hg38.sh "$bamfilepath" "$sample_output_dir"
 }
-cp $TEPIPE_DIR/scripts/submit_singu_run_insurveyor.sh bamfilepaths.txt $INS_DIR
+cp $TEPIPE_DIR/scripts/submit_singu_run_insurveyor_hg38.sh bamfilepaths.txt $INS_DIR
 
 (
 cd $INS_DIR || exit
@@ -172,3 +173,4 @@ cd ..
 
 # debug pending: CUSTOM Annotations added: /hpf/largeprojects/davidm/data/te_test/gnomad.v4.1.sv.sites_te_hg37_final.bed file is placed under /hpf/largeprojects/davidm/shilpa/TE-tools/annotsv_env/share/AnnotSV/Annotations_Human/Users/GRCh37/SVincludedInFt 
 #########################################
+
