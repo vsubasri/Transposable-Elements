@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH -J bam_preprocess
+#SBATCH -J bam_prep
 #SBATCH -o logs/%x_output_%j.log
 #SBATCH -e logs/%x_error_%j.log
 #SBATCH -N 1 -c 16
@@ -73,5 +73,7 @@ processed_combined_metrics="${output_dir}/${bam}_processed_combined_metrics.txt"
 bash process_metrics.sh $combined_metrics $processed_combined_metrics 
 
 #rm "${output_dir}/${bam}_wgs_metrics.txt" "${output_dir}/${bam}_alignment_metrics.txt" "${output_dir}/${bam}_bamfilestats.txt"
+rm $sorted_bam
 
 echo "Preprocessing and metrics calculation completed for: $bamfilepath"
+

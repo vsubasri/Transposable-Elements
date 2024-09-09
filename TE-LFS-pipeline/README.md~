@@ -38,3 +38,4 @@ TE-LFS-germline-pipe-hg38.sh : with hg38 reference genome
 TE-LFS-tumor-pipe.sh : with hg19 reference genome : This is to process germline and tumor samples. Melt is not available here. xTea's case-control feature has been used. New tool added is: TraFiC. 
 TE-LFS-tumor-pipe-hg38.sh : with hg38 reference genome : Same as tumor-pipe.sh, TraFiC not available for hg38 since its an old tool.
 
+
