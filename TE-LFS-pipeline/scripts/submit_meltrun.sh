@@ -11,12 +11,12 @@ set -euxo
 module load java/1.8.0_91 bowtie2 samtools
 
 melt_full_path="/hpf/largeprojects/davidm/shilpa/TE-tools/MELTv2.2.2"
-
-bamfilepath=$1
-wfolder=$2
 reference_fasta="/hpf/largeprojects/davidm/resources/hs37d5.fa"
 
-bam=$(basename "$bamfilepath")
+bamfilepath=$1
+sample_id=$(basename "$bamfilepath" | awk -F"." '{print $1}')
+wfolder=$sample_id
+mkdir -p $wfolder
 
 #ls $melt_full_path/me_refs/1KGP_Hg19/*.zip > mei_list.txt #need to be done only once
 

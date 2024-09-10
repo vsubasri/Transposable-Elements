@@ -12,9 +12,13 @@ set -euxo
 module load Singularity/3.11.3
 
 SINGULARITY_IMAGE="/hpf/largeprojects/davidm/shilpa/TE-tools/insurveyor.sif"
-bamfilepath=$1
-outputfoldername=$2
 reference_fasta="/hpf/largeprojects/davidm/resources/hs37d5.fa"
+
+bamfilepath=$1
+
+sample_id=$(basename "$bamfilepath" | awk -F"." '{print $1}')
+outputfoldername=$sample_id
+mkdir -p $outputfoldername
 
 export TMPDIR=$SCRATCH
 singularity run -B /hpf:/hpf $SINGULARITY_IMAGE --threads 16 $bamfilepath $outputfoldername $reference_fasta

@@ -65,7 +65,7 @@ cd $XTEA_DIR || exit
 #run_gnrt uses bamfile_desc.txt and creates folders corresponding to their sample_id
 
 #########################################
-## We won't be running MELT and Insurveyor for tumor samples
+## MELT and Insurveyor don't have an option to tumor samples
 #########################################
 # Step 3: TraFiC
 #########################################
@@ -78,6 +78,7 @@ process_trafic() {
     sbatch submit_singu_run_trafic.sh "config_trafic_$sample_id.yaml" "$sample_output_dir"
 }
 module load python/3.10.9
+
 (
 cd $TRAF_DIR || exit
 python3 make-config-trafic.py ##the config files should be created at fixed_bam because that folder will be used to --bind for TraFic container
