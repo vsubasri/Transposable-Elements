@@ -1,2 +1,0 @@
-@SQ	SN:HERV-K	LN:9472
-@PG	ID:bwa	PN:bwa	VN:0.7.17-r1188	CL:bwa mem -t 8 -o /hpf/largeprojects/davidm/vsubasri/transposable_elements/xTea/test/NA12878/HERV/tmp/cns/temp_disc.sam /hpf/largeprojects/davidm/vsubasri/transposable_elements/xTea/rep_lib_annotation/consensus/HERV.fa /hpf/largeprojects/davidm/vsubasri/transposable_elements/xTea/test/NA12878/HERV/tmp/cns/candidate_sites_all_disc.fa
