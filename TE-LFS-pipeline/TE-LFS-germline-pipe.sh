@@ -1,108 +1,137 @@
 #!/bin/bash
 
-# Transposable Elements prediction Pipeline for GERMLINE SAMPLES
+# Transposable Elements Analysis Pipeline GERMLINE SAMPLES
 
-# Usage: ./TE-LFS-germline-pipe.sh /path/to/bamdir (this would be used as $BAM_DIR)
+# Usage: ./TE-LFS-germline-pipe.sh /path/to/bamdir
 
 #########################################
 # Step 0: Setup and Configuration
 #########################################
 
-# Check if BAM_DIR argument is provided
-if [ -z "$1" ]; then
-  echo "Error: Missing argument for BAM_DIR."
-  echo "Usage: $0 /path/to/bamdir"
-  echo "Please provide the directory containing input BAM files as the first argument."
-  exit 1
-fi
+# filepaths.txt has paths for storing original bam file data, in case of germline pipeline it should have only 1 line for one folder. lets do bamfilepaths_NT.txt and bamfilepaths.txt
 
-BAM_DIR=$1 # the directory containing BAM files
+# Define the directory containing BAM files
+BAM_DIR="${1:-/hpf/largeprojects/davidm/data/te_test/germline_bam/}"
+# default BAM_DIR is also in case
 
-TEPIPE_DIR="/hpf/largeprojects/davidm/shilpa/TE-LFS-pipeline" # the directory where pipeline is located
-
-base_dir=$PWD # this is where all the output files will be created
-
-echo "The output files will be created in the current path: $base_dir"
-
+# output directories
 OUTPUT_DIR=$PWD/results
-BAM_fixed=$PWD/fixed_bams
+BAM_fixed=$OUTPUT_DIR/fixed_bams
 XTEA_DIR=$OUTPUT_DIR/xtea_runs
 MELT_DIR=$OUTPUT_DIR/melt_runs
 INS_DIR=$OUTPUT_DIR/ins_runs
 
-mkdir -p $XTEA_DIR $MELT_DIR $INS_DIR $BAM_fixed $XTEA_DIR/logs $MELT_DIR/logs $INS_DIR/logs $BAM_fixed/logs $INS_DIR/logs
+mkdir -p $XTEA_DIR $MELT_DIR $INS_DIR $BAM_fixed $XTEA_DIR/logs $MELT_DIR/logs $INS_DIR/logs $BAM_fixed/logs "logs"
 
 # Create bamfilepaths.txt bamfile_desc.txt and sample_id.txt
-find "$BAM_DIR" -name "*.bam" > rawbamfilepaths.txt
+ls $BAM_DIR/*.bam > data/bamfilepaths.txt
+awk -F"/" '{print $NF" "$0}' data/bamfilepaths.txt >data/bamfile_desc.txt
+awk -F".bam" '{print $1}' data/bamfile_desc.txt >data/sample_id.txt
 
 #########################################
 # Step 1: File Preprocessing
 #########################################
-cp rawbamfilepaths.txt $TEPIPE_DIR/scripts/submit_preprocessbam.sh $TEPIPE_DIR/scripts/process_metrics.sh $BAM_fixed
-cd $BAM_fixed
-bam_preprocess_job_ids=()
+cp data/bamfilepaths.txt $BAM_fixed
+(
+cd $BAM_fixed || exit
 while read -r bamfilepath; do
-	job_id=$(sbatch --parsable submit_preprocessbam.sh "$bamfilepath")
-	bam_preprocess_job_ids+=("$job_id")
-done < rawbamfilepaths.txt
-cd ..
+    sbatch submit_preprocessbam.sh "$bamfilepath"
+done < bamfilepaths.txt
+)
+# Wait for preprocessing to complete
+while squeue -u $USER | grep -q 'bam_preprocess'; do
+    sleep 100
+done
 
-echo "Processing bam files ..."
-
-job_ids_str=$(IFS=,; echo "${bam_preprocess_job_ids[*]}")
-echo " job ids corresponding are: $job_ids_str"
-#########################################
-
-sed "s|.*/|$BAM_fixed/sorted_fixed_|" rawbamfilepaths.txt > bamfilepaths.txt #ensure the filenames are correct _N and _T would be used in tumor pipeline
-awk -F"/" '{print substr($NF, 1, length($NF)-4) " " $0}' bamfilepaths.txt >bamfile_desc.txt
-awk '{print $1}' bamfile_desc.txt >sample_id.txt
-
-#########################################
-# TE prediction tools
 #########################################
 # Step 2: xTea
 #########################################
-cp $base_dir/bamfile_desc.txt $base_dir/sample_id.txt $TEPIPE_DIR/scripts/run_gnrt_pipeline_hg19.sh $TEPIPE_DIR/scripts/interm_set_prep_sbatch.sh $TEPIPE_DIR/scripts/slurm_header_xtea.txt $XTEA_DIR
 
-cd $XTEA_DIR
-   bash run_gnrt_pipeline_hg19.sh
-   #prepating files for slurm job
-   bash interm_set_prep_sbatch.sh
-   sed -i "s/sbatch < /sbatch --dependency=afterok:"\$1" /g" submit_scripts.sh #the TE calls will be submitted if the bam preprocessing runs are successful (afterok ensures this)
-   bash submit_scripts.sh $job_ids_str
-cd ../..
+cp data/bamfile_desc.txt data/sample_id.txt scripts/run_gnrt_pipeline_hg19.sh scripts/interm_set_prep_sbatch.sh scripts/slurm_header.txt $XTEA_DIR
+(
+cd $XTEA_DIR ||exit
+	bash run_gnrt_pipeline_hg19.sh
+	#prepating files for slurm job
+	bash interm_set_prep_sbatch.sh
+	bash submit_scripts.sh
+)
 
 #run_gnrt uses bamfile_desc.txt and creates folders corresponding to their sample_id
-
-echo "xTea runs submitted"
 
 #########################################
 # Step 3: MELT
 #########################################
 
-cp $TEPIPE_DIR/scripts/submit_meltrun.sh $base_dir/bamfilepaths.txt $MELT_DIR
-
-cd $MELT_DIR
+process_melt() {
+    local bamfilepath=$1
+    local sample_id=$(basename "$bamfilepath" | awk -F"." '{print $1}')
+    local sample_output_dir=$MELT_DIR/$sample_id
+    mkdir -p $sample_output_dir
+    sbatch submit_meltrun.sh "$bamfilepath" "$sample_output_dir"
+}
+cp scripts/submit_meltrun.sh data/bamfilepaths.txt $MELT_DIR
+(
+cd $MELT_DIR || exit
 while read -r bamfilepath; do
-    sbatch --dependency=afterok:$job_ids_str submit_meltrun.sh "$bamfilepath"
+    process_melt $bamfilepath
 done < bamfilepaths.txt
-cd ../..
-
-echo "Melt runs submitted"
+)
 
 ##########################################
 # Step 4: INSurVeyor
 ##########################################
 
-cp $TEPIPE_DIR/scripts/submit_singu_run_insurveyor.sh $base_dir/bamfilepaths.txt $INS_DIR
+process_ins() {
+    local bamfilepath=$1
+    #local sample_id=$(awk -F".bam" '{print $1}' $bamfilepath)
+    local sample_id=$(basename "$bamfilepath" | awk -F"." '{print $1}')
+    local sample_output_dir=$INS_DIR/$sample_id
+    mkdir -p $sample_output_dir
+    sbatch submit_meltrun.sh "$bamfilepath" "$sample_output_dir"
+}
+cp scripts/submit_singu_run_insurveyor.sh data/bamfilepaths.txt $INS_DIR
 
-cd $INS_DIR
+(
+cd $INS_DIR || exit
 while read -r bamfilepath; do
-	sbatch --dependency=afterok:$job_ids_str submit_singu_run_insurveyor.sh "$bamfilepath"
+	process_ins $bamfilepath
 done < bamfilepaths.txt
-cd ../..
 
-echo "INSurVeyor runs submitted"
-##########################################
-squeue -u $USER
-##########################################
+)
+#########################################
+# Step 5: new tool
+#########################################
+
+
+#########################################
+# Step 6: SURVIVOR
+#########################################
+
+#wait for TE-runs to complete
+#while squeue -u $USER | grep -q 'xtea_runs | melt_runs| ins_runs'; do
+#    sleep 100
+#done
+
+# List VCF files
+#ls *vcf > sample_files.txt
+
+# Merge VCF files with SURVIVOR
+#./SURVIVOR merge sample_files.txt 1000 2 1 1 0 30 sample_merged.vcf
+#   SURVIVOR merge sample_files 100 2 1 0 0 30 sample_merged.vcf
+#ALU SVA L1
+#########################################
+# Step 7: Annotations
+#########################################
+
+# Load necessary modules
+#module load AnnotSV
+#module load bcftools
+#module load bedtools
+
+# Annotate merged VCF file
+#AnnotSV -SVinputFile sample_merged.vcf
+
+# This should create an output folder with annotated files.
+
+#########################################
+
