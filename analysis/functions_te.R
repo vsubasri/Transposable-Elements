@@ -1,3 +1,630 @@
+#### TRACKING HELPER FUNCTIONS ####
+
+# Split HostSeq samples into filtering and analysis groups
+# Args:
+#   te_data: TE dataframe with sample column
+#   filter_pct: Percentage of HostSeq samples to use for filtering (default 66%)
+#   seed: Random seed for reproducibility (default 123)
+# Returns:
+#   List with:
+#     - filter_samples: Vector of sample IDs for filtering group
+#     - analysis_samples: Vector of sample IDs for analysis group
+#     - te_filter: TE data with only filtering group HostSeq samples (for determining common TEs)
+#     - te_analysis: TE data with filtering group HostSeq samples removed (for analysis)
+split_hostseq_samples <- function(te_data, filter_pct = 66, seed = 123) {
+
+  cat("\n===== SPLITTING HOSTSEQ SAMPLES (STRATIFIED BY ANCESTRY) =====\n")
+
+  # Set seed for reproducibility
+  set.seed(seed)
+
+  # Get all HostSeq sample IDs with their ancestry
+  hostseq_data <- te_data %>%
+    filter(grepl("^HS_", sample)) %>%
+    distinct(sample, .keep_all = TRUE) %>%
+    select(sample, predicted_ancestry_thres)
+
+  n_hostseq <- nrow(hostseq_data)
+
+  if (n_hostseq == 0) {
+    cat("Warning: No HostSeq samples found. Adding hostseq_group column with NA.\n")
+    te_data$hostseq_group <- NA_character_
+    return(list(
+      filter_samples = character(0),
+      analysis_samples = character(0),
+      te_data = te_data
+    ))
+  }
+
+  # Stratified split by ancestry
+  filter_samples <- c()
+  analysis_samples <- c()
+
+  # Split within each ancestry group
+  for (ancestry_group in unique(hostseq_data$predicted_ancestry_thres)) {
+    samples_in_group <- hostseq_data %>%
+      filter(predicted_ancestry_thres == ancestry_group) %>%
+      pull(sample)
+
+    n_in_group <- length(samples_in_group)
+    n_filter_group <- round(n_in_group * filter_pct / 100)
+
+    filter_in_group <- sample(samples_in_group, n_filter_group)
+    analysis_in_group <- setdiff(samples_in_group, filter_in_group)
+
+    filter_samples <- c(filter_samples, filter_in_group)
+    analysis_samples <- c(analysis_samples, analysis_in_group)
+
+    cat("Ancestry:", ancestry_group, "- Total:", n_in_group,
+        "| Filter:", length(filter_in_group), "| Analysis:", length(analysis_in_group), "\n")
+  }
+
+  cat("\nTotal HostSeq samples:", n_hostseq, "\n")
+  cat("Filter group (", filter_pct, "%):", length(filter_samples), "samples\n", sep = "")
+  cat("Analysis group (", 100 - filter_pct, "%):", length(analysis_samples), "samples\n", sep = "")
+
+  # Add hostseq_group column to label samples
+  te_data$hostseq_group <- case_when(
+    te_data$sample %in% filter_samples ~ "filter",
+    te_data$sample %in% analysis_samples ~ "analysis",
+    TRUE ~ NA_character_
+  )
+
+  cat("Labeled HostSeq samples in dataset (stratified by ancestry)\n")
+  cat("=====================================\n\n")
+
+  return(list(
+    filter_samples = filter_samples,
+    analysis_samples = analysis_samples,
+    te_data = te_data
+  ))
+}
+
+# Replace HostSeq filter group samples with analysis group samples
+# Used after filtering to swap in the independent analysis group for final analysis
+# Args:
+#   te_data: Processed TE data that includes filter group HostSeq samples
+#   filter_samples: Vector of filter group sample IDs
+#   te_analysis: TE data with only analysis group HostSeq + non-HostSeq samples
+# Returns:
+#   TE data with filter group removed and analysis group added
+replace_hostseq_with_analysis_group <- function(te_data, filter_samples, te_analysis, verbose = FALSE) {
+
+  if (verbose) {
+    cat("\n===== REPLACING HOSTSEQ FILTER GROUP WITH ANALYSIS GROUP =====\n")
+    # Count before
+    hostseq_before <- sum(grepl("^HS_", te_data$sample))
+    cat("HostSeq rows before replacement:", hostseq_before, "\n")
+  }
+
+  # Remove filter group HostSeq samples
+  te_no_filter <- te_data %>%
+    filter(!sample %in% filter_samples)
+
+  # Get analysis group HostSeq samples from te_analysis
+  te_analysis_hostseq <- te_analysis %>%
+    filter(grepl("^HS_", sample))
+
+  # Ensure column type compatibility before binding
+  # Get common columns
+  common_cols <- intersect(names(te_no_filter), names(te_analysis_hostseq))
+
+  # For each common column, ensure matching types
+  for (col in common_cols) {
+    class_nofilter <- class(te_no_filter[[col]])[1]
+    class_analysis <- class(te_analysis_hostseq[[col]])[1]
+
+    if (class_nofilter != class_analysis) {
+      # Convert both to character for safety, unless both are numeric-compatible
+      if ((class_nofilter %in% c("numeric", "integer", "double")) &&
+          (class_analysis %in% c("numeric", "integer", "double"))) {
+        te_no_filter[[col]] <- as.numeric(te_no_filter[[col]])
+        te_analysis_hostseq[[col]] <- as.numeric(te_analysis_hostseq[[col]])
+      } else if (class_nofilter == "logical" || class_analysis == "logical") {
+        te_no_filter[[col]] <- as.character(te_no_filter[[col]])
+        te_analysis_hostseq[[col]] <- as.character(te_analysis_hostseq[[col]])
+      } else {
+        te_no_filter[[col]] <- as.character(te_no_filter[[col]])
+        te_analysis_hostseq[[col]] <- as.character(te_analysis_hostseq[[col]])
+      }
+    }
+  }
+
+  # Combine - use bind_rows to handle different columns
+  te_with_analysis <- bind_rows(te_no_filter, te_analysis_hostseq)
+
+  if (verbose) {
+    # Count after
+    hostseq_after <- sum(grepl("^HS_", te_with_analysis$sample))
+    cat("HostSeq rows after replacement:", hostseq_after, "\n")
+    cat("Analysis group HostSeq samples:", length(unique(te_analysis_hostseq$sample)), "\n")
+    cat("==============================================================\n\n")
+  }
+
+  return(te_with_analysis)
+}
+
+# Analyze sensitivity of common TE filtering to HostSeq sample size
+# Tests different numbers of HostSeq samples for filtering and plots how many TEs are removed
+# Args:
+#   te_data: TE data with all HostSeq samples (before splitting)
+#   rare_gnomad: gnomAD threshold percentage (e.g., 3)
+#   rare_hostseq: HostSeq threshold percentage (e.g., 3)
+#   sample_sizes: Vector of sample sizes to test (if NULL, uses seq from 10% to 100% by 10%)
+#   output_dir: Directory to save plot
+#   output_prefix: Prefix for output file name
+#   seed: Random seed for reproducibility
+# Returns:
+#   ggplot object
+analyze_hostseq_filter_sensitivity <- function(te_data, rare_gnomad = 3, rare_hostseq = 3,
+                                               sample_sizes = NULL, output_dir = NULL,
+                                               output_prefix = "te", seed = 123) {
+
+  cat("\n===== HOSTSEQ FILTER SENSITIVITY ANALYSIS =====\n")
+
+  # Get all HostSeq samples
+  all_hostseq <- unique(te_data$sample[grepl("^HS_", te_data$sample)])
+  n_total_hostseq <- length(all_hostseq)
+
+  cat("Total HostSeq samples available:", n_total_hostseq, "\n")
+
+  if (n_total_hostseq == 0) {
+    cat("Warning: No HostSeq samples found. Cannot perform sensitivity analysis.\n")
+    return(NULL)
+  }
+
+  # Define sample sizes to test if not provided
+  if (is.null(sample_sizes)) {
+    # Test 10%, 20%, ..., 100%
+    percentages <- seq(10, 100, by = 10)
+    sample_sizes <- round(n_total_hostseq * percentages / 100)
+    # Make sure we don't exceed total
+    sample_sizes <- unique(pmin(sample_sizes, n_total_hostseq))
+  }
+
+  cat("Testing filter group sizes:", paste(sample_sizes, collapse = ", "), "\n")
+
+  # Count initial TEs
+  n_tes_initial <- nrow(te_data)
+  n_unique_tes_initial <- te_data %>%
+    distinct(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
+    nrow()
+
+  cat("Initial TEs (total insertions):", n_tes_initial, "\n")
+  cat("Initial TEs (unique):", n_unique_tes_initial, "\n")
+
+  # Store results
+  results <- data.frame(
+    n_samples = integer(),
+    n_tes_filtered = integer(),
+    n_unique_tes_filtered = integer(),
+    n_tes_remaining = integer(),
+    n_unique_tes_remaining = integer()
+  )
+
+  # Set seed
+  set.seed(seed)
+
+  # Test each sample size
+  for (n_filter in sample_sizes) {
+    cat("\nTesting with", n_filter, "HostSeq samples...\n")
+
+    # Randomly sample HostSeq samples for this test
+    filter_samples_test <- sample(all_hostseq, n_filter)
+
+    # Create filter dataset (filter group + non-HostSeq)
+    te_filter_test <- te_data %>%
+      filter(!grepl("^HS_", sample) | sample %in% filter_samples_test)
+
+    # Apply filtering (use the appropriate filter function based on data type)
+    if ("data.table" %in% class(te_data)) {
+      te_filtered_test <- filter_common_hostseq_germline_te(
+        te = te_filter_test,
+        rare_gnomad_threshold = rare_gnomad,
+        rare_hostseq_threshold = rare_hostseq
+      )
+    } else {
+      te_filtered_test <- filter_common_hostseq_germline_te(
+        te = te_filter_test,
+        rare_gnomad_threshold = rare_gnomad,
+        rare_hostseq_threshold = rare_hostseq
+      )
+    }
+
+    # Count TEs after filtering
+    n_tes_after <- nrow(te_filtered_test)
+    n_unique_tes_after <- te_filtered_test %>%
+      distinct(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
+      nrow()
+
+    # Calculate filtered counts
+    n_tes_filtered <- n_tes_initial - n_tes_after
+    n_unique_tes_filtered <- n_unique_tes_initial - n_unique_tes_after
+
+    cat("  TEs filtered (total):", n_tes_filtered, "\n")
+    cat("  TEs filtered (unique):", n_unique_tes_filtered, "\n")
+
+    # Store results
+    results <- rbind(results, data.frame(
+      n_samples = n_filter,
+      n_tes_filtered = n_tes_filtered,
+      n_unique_tes_filtered = n_unique_tes_filtered,
+      n_tes_remaining = n_tes_after,
+      n_unique_tes_remaining = n_unique_tes_after
+    ))
+  }
+
+  cat("\n--- Sensitivity Analysis Complete ---\n")
+  cat("Results summary:\n")
+  print(results)
+
+  # Create plot
+  p <- ggplot(results, aes(x = n_samples, y = n_unique_tes_filtered)) +
+    geom_line(color = "blue", linewidth = 1) +
+    geom_point(color = "blue", size = 3) +
+    labs(
+      title = "Sensitivity of Common TE Filtering to HostSeq Sample Size",
+      x = "Number of HostSeq Samples Used for Filtering",
+      y = "Number of Unique TEs Filtered Out as Common",
+      subtitle = paste0("Total HostSeq samples available: ", n_total_hostseq,
+                        " | gnomAD threshold: ", rare_gnomad, "% | HostSeq threshold: ", rare_hostseq, "%")
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5)
+    ) +
+    scale_x_continuous(breaks = sample_sizes)
+
+  # Save plot
+  if (!is.null(output_dir)) {
+    ggsave(paste0(output_dir, output_prefix, "_hostseq_filter_sensitivity.png"),
+           plot = p, width = 10, height = 6)
+    cat("✓ Plot saved to:", paste0(output_prefix, "_hostseq_filter_sensitivity.png"), "\n")
+  }
+
+  cat("==============================================\n\n")
+
+  return(p)
+}
+
+# Find TEs overlapping with methylation probe regions
+# Args:
+#   te_expand: TE expanded dataframe (must have SV_chrom, SV_start, SV_length, sample, TP53_status)
+#   probe_file: Path to methylation probe CSV file (must have chr, pos, end columns)
+#   min_overlap_pct: Minimum percentage of probe region that must overlap with TE (default 70%)
+#   output_file: Path to save output CSV (optional)
+# Returns:
+#   Dataframe with probe regions and their TE overlaps
+find_te_probe_overlaps <- function(te_expand, probe_file, min_overlap_pct = 0, output_file = NULL) {
+
+  cat("\n===== FINDING TE-PROBE OVERLAPS =====\n")
+
+  # Load probe data
+  if (!file.exists(probe_file)) {
+    cat("Error: Probe file not found:", probe_file, "\n")
+    return(NULL)
+  }
+
+  meth_probes <- read.csv(probe_file, stringsAsFactors = FALSE)
+  cat("Loaded", nrow(meth_probes), "methylation probes\n")
+
+  # Check required columns
+  required_cols <- c("chr", "pos", "end")
+  missing_cols <- setdiff(required_cols, colnames(meth_probes))
+  if (length(missing_cols) > 0) {
+    cat("Error: Missing required columns in probe file:", paste(missing_cols, collapse = ", "), "\n")
+    return(NULL)
+  }
+
+  # Calculate TE end from start + length
+  te_expand <- te_expand %>%
+    mutate(TE_end_calc = SV_start + SV_length)
+
+  # Check required TE columns
+  te_required_cols <- c("SV_chrom", "SV_start", "sample", "TP53_status")
+  missing_te_cols <- setdiff(te_required_cols, colnames(te_expand))
+  if (length(missing_te_cols) > 0) {
+    cat("Error: Missing required columns in TE data:", paste(missing_te_cols, collapse = ", "), "\n")
+    return(NULL)
+  }
+
+  cat("Minimum overlap percentage:", min_overlap_pct, "%\n")
+
+  # Process each probe region
+  results <- list()
+
+  for (i in 1:nrow(meth_probes)) {
+    probe <- meth_probes[i, ]
+    probe_chr <- as.character(probe$chr)
+    probe_start <- probe$pos
+    probe_end <- probe$end
+    probe_length <- probe_end - probe_start + 1
+
+    # Create region identifier
+    region_id <- paste0(probe_chr, ":", probe_start, "-", probe_end)
+
+    # Find overlapping TEs
+    overlapping_tes <- te_expand %>%
+      filter(
+        SV_chrom == probe_chr,
+        # TE overlaps probe if TE end > probe start AND TE start < probe end
+        TE_end_calc > probe_start,
+        SV_start < probe_end
+      ) %>%
+      mutate(
+        # Calculate overlap length
+        overlap_start = pmax(SV_start, probe_start),
+        overlap_end = pmin(TE_end_calc, probe_end),
+        overlap_length = overlap_end - overlap_start + 1,
+        overlap_pct = (overlap_length / probe_length) * 100
+      ) %>%
+      filter(overlap_pct >= min_overlap_pct)
+
+    # Calculate statistics
+    n_overlaps <- nrow(overlapping_tes)
+
+    if (n_overlaps > 0) {
+      samples <- paste(unique(overlapping_tes$sample), collapse = ";")
+
+      # Calculate mean overlap percentage for this probe
+      mean_overlap_pct <- mean(overlapping_tes$overlap_pct, na.rm = TRUE)
+
+      # Count TP53 status
+      tp53_counts <- overlapping_tes %>%
+        distinct(sample, TP53_status) %>%
+        count(TP53_status)
+
+      n_tp53_mut <- tp53_counts %>% filter(TP53_status == "Mutant") %>% pull(n) %>% sum()
+      n_tp53_wt <- tp53_counts %>% filter(TP53_status == "WT") %>% pull(n) %>% sum()
+
+      if (length(n_tp53_mut) == 0) n_tp53_mut <- 0
+      if (length(n_tp53_wt) == 0) n_tp53_wt <- 0
+    } else {
+      samples <- ""
+      mean_overlap_pct <- 0
+      n_tp53_mut <- 0
+      n_tp53_wt <- 0
+    }
+
+    results[[i]] <- data.frame(
+      region = region_id,
+      chr = probe_chr,
+      start = probe_start,
+      end = probe_end,
+      n_overlaps = n_overlaps,
+      mean_overlap_pct = round(mean_overlap_pct, 2),
+      samples = samples,
+      n_tp53_mut = n_tp53_mut,
+      n_tp53_wt = n_tp53_wt,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # Combine results
+  results_df <- bind_rows(results)
+
+  # Summary
+  cat("\nResults summary:\n")
+  cat("  Total probe regions:", nrow(results_df), "\n")
+  cat("  Regions with TE overlaps:", sum(results_df$n_overlaps > 0), "\n")
+  cat("  Total TE overlaps:", sum(results_df$n_overlaps), "\n")
+
+  # Filter to only regions with overlaps for output
+  results_with_overlaps <- results_df %>%
+    filter(n_overlaps > 0)
+
+  # Save to CSV if output file specified - only include rows with overlaps
+  if (!is.null(output_file)) {
+    write.csv(results_with_overlaps, output_file, row.names = FALSE)
+    cat("✓ Results saved to:", output_file, "(", nrow(results_with_overlaps), "probes with overlaps)\n")
+  }
+
+  cat("=====================================\n\n")
+
+  return(results_df)
+}
+
+# Initialize tracking for a filtering step
+init_step_tracking <- function(df, sample_col = "sample") {
+  list(
+    te_count = nrow(df),
+    sample_count = length(unique(df[[sample_col]]))
+  )
+}
+
+# Calculate loss between two steps
+calc_step_loss <- function(prev_count, curr_count) {
+  loss <- prev_count - curr_count
+  loss_pct <- if (prev_count > 0) (loss / prev_count) * 100 else 0
+  list(loss = loss, loss_pct = loss_pct)
+}
+
+# Extract count from captured stdout by pattern
+extract_count_from_stdout <- function(stdout_lines, pattern) {
+  for (line in stdout_lines) {
+    if (grepl(pattern, line)) {
+      numbers <- as.numeric(unlist(regmatches(line, gregexpr("[0-9]+", line))))
+      if (length(numbers) > 0) {
+        return(numbers)
+      }
+    }
+  }
+  return(NA)
+}
+
+# Extract single value from stdout by pattern and regex group
+extract_value_from_stdout <- function(stdout_lines, pattern, regex_group = "\\1") {
+  for (line in stdout_lines) {
+    if (grepl(pattern, line)) {
+      value <- as.numeric(gsub(pattern, regex_group, line))
+      return(value)
+    }
+  }
+  return(NA)
+}
+
+# Count unique TE loci with error handling
+count_unique_te_loci <- function(df, primary_cols = c("SV_chrom", "SV_start", "SV_end", "SV_length", "ALT"),
+                                  fallback_cols = c("SV_chrom", "SV_start", "SV_end", "ALT"),
+                                  fallback_value = NA) {
+  tryCatch({
+    if (all(primary_cols %in% colnames(df))) {
+      result <- nrow(unique(df[, primary_cols]))
+      cat("Counted unique TE loci using primary columns:", result, "\n")
+      return(result)
+    } else if (all(fallback_cols %in% colnames(df))) {
+      result <- nrow(unique(df[, fallback_cols]))
+      cat("Counted unique TE loci using fallback columns:", result, "\n")
+      return(result)
+    } else {
+      # Silently return fallback value - columns not available
+      return(fallback_value)
+    }
+  }, error = function(e) {
+    cat("Error calculating unique TE loci:", e$message, "\n")
+    return(fallback_value)
+  })
+}
+
+# Extract step4 sample metrics from final_te_count
+extract_step4_metrics <- function(final_te_count, step3_sample_count, process_stdout) {
+  metrics <- list(
+    total_samples = NA,
+    samples_with_tes = NA,
+    samples_no_tes = NA,
+    total_te_insertions = NA
+  )
+
+  if ("combination" %in% colnames(final_te_count)) {
+    total_combo <- final_te_count[final_te_count$combination == "total", ]
+    metrics$samples_with_tes <- sum(total_combo$count > 0)
+    metrics$samples_no_tes <- sum(total_combo$count == 0)
+    metrics$total_samples <- nrow(total_combo)
+    metrics$total_te_insertions <- sum(total_combo$count)
+  } else {
+    # Extract from process output
+    no_hits_line <- grep("Adding .* samples with no TE insertions", process_stdout, value = TRUE)
+    if (length(no_hits_line) > 0) {
+      no_hits_added <- as.numeric(gsub(".*Adding (\\d+) samples.*", "\\1", no_hits_line[1]))
+      metrics$total_samples <- step3_sample_count + no_hits_added
+      metrics$samples_with_tes <- step3_sample_count
+      metrics$samples_no_tes <- no_hits_added
+    } else if ("sample" %in% colnames(final_te_count)) {
+      metrics$total_samples <- length(unique(final_te_count$sample))
+    } else {
+      metrics$total_samples <- nrow(final_te_count)
+    }
+  }
+
+  return(metrics)
+}
+
+# Write captured output to file
+write_stdout_to_file <- function(stdout_lines, file_path, header, append = TRUE) {
+  tryCatch({
+    # Ensure the output lines are character vectors
+    if (is.null(stdout_lines) || length(stdout_lines) == 0) {
+      warning("No output to write for: ", header)
+      return(invisible(NULL))
+    }
+
+    # Create directory if it doesn't exist
+    output_dir <- dirname(file_path)
+    if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE)
+    }
+
+    # Write output with explicit connection handling
+    con <- file(file_path, open = if(append) "a" else "w")
+    on.exit(close(con), add = TRUE)
+
+    writeLines(c(paste0("\n--- ", header, " ---"), stdout_lines), con)
+    flush(con)
+
+    invisible(TRUE)
+  }, error = function(e) {
+    cat("ERROR in write_stdout_to_file:", e$message, "\n")
+    cat("Attempting fallback write method...\n")
+    tryCatch({
+      # Fallback: use cat() directly
+      cat(c(paste0("\n--- ", header, " ---\n"), stdout_lines, "\n"),
+          file = file_path, append = append, sep = "\n")
+      invisible(TRUE)
+    }, error = function(e2) {
+      cat("CRITICAL ERROR: Could not write to file:", e2$message, "\n")
+      invisible(FALSE)
+    })
+  })
+}
+
+#### TE FILTERING FUNCTIONS ####
+
+# TE type filtering function
+filter_te_types <- function(te_data, include_alu = TRUE, include_sva = TRUE) {
+  initial_count <- nrow(te_data)
+  te_types_to_remove <- c()
+
+  if (!include_alu) te_types_to_remove <- c(te_types_to_remove, "ALU")
+  if (!include_sva) te_types_to_remove <- c(te_types_to_remove, "SVA")
+
+  if (length(te_types_to_remove) > 0) {
+    pattern <- paste0("-(", paste(te_types_to_remove, collapse = "|"), ")$")
+    te_data <- te_data[!grepl(pattern, ID)]
+    removed_count <- initial_count - nrow(te_data)
+    cat(sprintf("Removed %d insertions (%s) from analysis\n", removed_count, paste(te_types_to_remove, collapse = ", ")))
+  } else {
+    cat("Including all TE types (LINE1, ALU, SVA)\n")
+  }
+  cat(sprintf("Remaining insertions: %d\n", nrow(te_data)))
+
+  return(te_data)
+}
+
+# Cohort summary statistics table
+create_cohort_summary <- function(te_data, hostseq_cancer = NULL) {
+  cohorts <- sort(unique(te_data$cohort))
+  cohorts <- cohorts[!is.na(cohorts)]
+
+  cohort_table <- data.frame()
+
+  for (coh in cohorts) {
+    cohort_data <- te_data[te_data$cohort == coh, ]
+    total <- nrow(cohort_data)
+    tp53_wt <- sum(cohort_data$TP53_status == "WT", na.rm = TRUE)
+    tp53_mut <- sum(cohort_data$TP53_status == "Mutant", na.rm = TRUE)
+
+    # Determine cancer/control counts
+    if (!is.null(hostseq_cancer)) {
+      # For germline data with hostseq_cancer mapping
+      cancer_yes <- sum(cohort_data$sample %in% hostseq_cancer$sample[hostseq_cancer$Cancer == "Yes"], na.rm = TRUE)
+    } else {
+      # For tumour data - all samples are cancer
+      cancer_yes <- total
+    }
+
+    cohort_table <- rbind(cohort_table, data.frame(
+      Cohort = coh,
+      Total = total,
+      TP53_WT = tp53_wt,
+      TP53_Mutant = tp53_mut,
+      Cancer = cancer_yes
+    ))
+  }
+
+  # Add TOTAL row
+  total_row <- data.frame(
+    Cohort = "TOTAL",
+    Total = sum(cohort_table$Total),
+    TP53_WT = sum(cohort_table$TP53_WT),
+    TP53_Mutant = sum(cohort_table$TP53_Mutant),
+    Cancer = sum(cohort_table$Cancer)
+  )
+  cohort_table <- rbind(cohort_table, total_row)
+
+  return(cohort_table)
+}
+
 # graph functions
 #colours <- c("#DDD8C4", "#5FBFF9")
 #colour_palette_3<- c("#DDD8C4", "#5FBFF9", "#235789")
@@ -9,7 +636,7 @@ mutation_colours <- c("#DDD8C4", "#0090B8", "#004052")
 colour_palette_3<- c("#AB1368", "#B1D586", "#0080A3")
 colour_palette_4_seq<- c("#005066", "#0080A3", "#00B0E0", "#99E9FF")
 colour_palette_4<- c("#B1D586", "#0080A3", "#AB1368", '#ffcc66')
-color_palette_5 <- c("#DDD8C4", "#5FBFF9", '#99ff99', '#ffcc66', '#ff6666')
+colour_palette_5 <- c("#DDD8C4", "#5FBFF9", '#99ff99', '#ffcc66', '#ff6666')
 color_palette_6 <- c("#DDD8C4", "#5FBFF9", "#235789", '#99ff99', '#ffcc66', '#ff6666')
 
 
@@ -94,32 +721,172 @@ prep_hostseq <- function(df) {
 }
 
 prep_metrics <- function(df) {
-  # Rename the columns of the dataframe
-  names(df) <- c("sample", "mean_cov", "sd_cov", "med_cov", "total_reads", 
-                 "mean_read_len", "sd_read_len", "med_read_len", "pct_chimeras", "avg_quality")
-  
-  # Modify the 'sample' column for entries ending in _N
+
+  ## --- 1. Rename columns --------------------------------------------------
+  names(df) <- c("sample", "mean_cov", "sd_cov", "med_cov", "total_reads",
+                 "mean_read_len", "sd_read_len", "med_read_len",
+                 "pct_chimeras", "avg_quality")
+
+  ## --- 2. Normalise sample IDs -------------------------------------------
+  # For HostSeq samples (start with 20-, 21-, 22-, or HS_), just add _N if not there
+  # For other samples ending with _N, normalize to base_sample_N format
   df$sample <- ifelse(grepl("_N$", df$sample),
-                      paste0(sub("_.*", "", df$sample), "_N"),
-                      df$sample)
-  
-  return(df)
+                      ifelse(grepl("^(20-|21-|22-|HS_)", df$sample),
+                             df$sample,  # HostSeq: keep as is
+                             paste0(sub("_.*", "", df$sample), "_N")),  # Non-HostSeq: extract before first underscore
+                      paste0(df$sample, "_N"))  # No _N at end: add it
+
+  ## --- 3. Deduplicate -----------------------------------------------------
+  setDT(df)                      # convert to data.table *in-place*
+  df   <- unique(df, by = "sample")   # keep first row for each sample
+
+  return(df[])
+}
+
+prep_metrics_tumour <- function(df) {
+
+  ## --- 1. Rename columns --------------------------------------------------
+  names(df) <- c("sample", "mean_cov", "sd_cov", "med_cov", "total_reads",
+                 "mean_read_len", "sd_read_len", "med_read_len",
+                 "pct_chimeras", "avg_quality")
+
+  ## --- 2. Normalise sample IDs -------------------------------------------
+  # For tumor samples ending with _T, keep them as is
+  # For HostSeq samples (start with 20-, 21-, 22-, or HS_), just add _T if not there
+  # For other samples ending with _N, normalize to base_sample_N format
+  df$sample <- ifelse(grepl("_T$", df$sample),
+                      df$sample,  # Tumor: keep as is
+                      ifelse(grepl("_N$", df$sample),
+                             ifelse(grepl("^(20-|21-|22-|HS_)", df$sample),
+                                    df$sample,  # HostSeq: keep as is
+                                    paste0(sub("_.*", "", df$sample), "_N")),  # Non-HostSeq: extract before first underscore
+                             paste0(df$sample, "_T")))  # No suffix: add _T
+
+  ## --- 3. Deduplicate -----------------------------------------------------
+  setDT(df)                      # convert to data.table *in-place*
+  df   <- unique(df, by = "sample")   # keep first row for each sample
+
+  return(df[])
 }
  
-prep_ancestry_kics <-function(df) {
+prep_ancestry <-function(df) {
   # Ensure the column exists
   if (!"indivID" %in% colnames(df)) {
     stop("The dataframe does not have an 'indivID' column.")
   }
-  
-  # Create a new sample column based on indivID
-  df$sample <- gsub("^KICS_|-N$", "", df$indivID) # Remove 'KICS_' and '-N'
-  df$sample <- paste0(df$sample, "_N")            # Add '_N' at the end
-  
-  # Keep only sample and predicted_ancestry_thres columns
-  df <- df[, c("sample", "predicted_ancestry_thres")]
-  
+
+  # Create a new sample column based on indivID with updated rules
+  df$sample <- df$indivID
+
+  # Remove 'sorted_fixed_control_' from the beginning
+  df$sample <- gsub("^sorted_fixed_control_", "", df$sample)
+
+  # Remove 'sorted_fixed_' from the beginning
+  df$sample <- gsub("^sorted_fixed_", "", df$sample)
+
+  # Remove 'KICS_' from the beginning
+  df$sample <- gsub("^KICS_", "", df$sample)
+
+  # Remove 'LFS_' from the beginning
+  df$sample <- gsub("^LFS_", "", df$sample)
+
+  # Remove 'H_LC-' from the beginning
+  df$sample <- gsub("^H_LC-", "", df$sample)
+
+  # If starts with H (flowcell ID) or starts with 20/21/22 and ends with A-02-00, add HS_ at beginning
+  df$sample <- ifelse(grepl("^H", df$sample) | grepl("^(20|21|22).*A-02-00", df$sample),
+                      paste0("HS_", df$sample),
+                      df$sample)
+
+  # Remove '-N_realigned_recalibrated' from the end
+  df$sample <- gsub("-N_realigned_recalibrated$", "", df$sample)
+
+  # Remove '-N' from the end
+  df$sample <- gsub("-N$", "", df$sample)
+
+  # Remove '_merged' from the end
+  df$sample <- gsub("_merged$", "", df$sample)
+
+  # Remove '-G' from the end
+  df$sample <- gsub("-G$", "", df$sample)
+
+  # Remove '_G1' from the end
+  df$sample <- gsub("_G1$", "", df$sample)
+
+  # Add '_N' at the end only if it's not already there
+  df$sample <- ifelse(grepl("_N$", df$sample), df$sample, paste0(df$sample, "_N"))
+
+  # Keep sample, predicted_ancestry_thres, and mapped_label (if available)
+  cols_to_keep <- c("sample", "predicted_ancestry_thres")
+  if ("mapped_label" %in% colnames(df)) {
+    cols_to_keep <- c(cols_to_keep, "mapped_label")
+  }
+  df <- df[, cols_to_keep]
+
   return(df)
+}
+
+# Load and prepare KICS germline sample type data
+prep_kics_sample_type <- function(sample_type_path, add_suffix = "_N") {
+  # Load KICS germline sample type data from CSV
+  kics_sample_type <- read.csv(sample_type_path, stringsAsFactors = FALSE)
+
+  # Pad sample column with leading zeros (10 -> 0010)
+  kics_sample_type$sample <- sprintf("%04d", as.numeric(kics_sample_type$sample))
+
+  # Add suffix if specified (e.g., _N for germline, _T for tumor)
+  if (!is.null(add_suffix) && add_suffix != "") {
+    kics_sample_type$sample <- paste0(kics_sample_type$sample, add_suffix)
+  }
+
+  return(kics_sample_type)
+}
+
+# Analyze TE burden by sample type (KICS)
+analyze_sample_type <- function(te_data, sample_type_data, types, plot_dir,
+                                filter_types = c("Blood", "Fibroblasts", "Tissue (fresh)"),
+                                min_samples = 3) {
+  # Merge sample type with TE data
+  te_sample_type <- merge_dfs(te_data, sample_type_data, include_all_x = TRUE,
+                              print_info = TRUE, dataset_name = "sample_type")
+
+  # Filter for specific sample types
+  te_sample_type_filtered <- te_sample_type %>%
+    filter(sample_type %in% filter_types)
+
+  cat("Samples with sample type data:", nrow(te_sample_type_filtered), "\n")
+  cat("Sample type distribution:\n")
+  print(table(te_sample_type_filtered$sample_type))
+
+  # Generate plots for all TE types
+  plots <- vector("list", length(types))
+  for (i in seq_along(types)) {
+    type_label <- ifelse(is.na(types[i]), "all", types[i])
+
+    plots[[i]] <- plot_count_kruskal_nogroup(
+      te_sample_type_filtered,
+      column = "sample_type",
+      min = min_samples,
+      chr = NA,
+      type = types[i],
+      x_lab = "Sample Type",
+      y_lab = "Repeat count",
+      log_scale = TRUE
+    )
+
+    # Save plot
+    ggsave(
+      paste0(plot_dir, "counts_cohort/te_count_kics_sampletype_", type_label, ".pdf"),
+      plot = plots[[i]],
+      width = 9,
+      height = 5
+    )
+  }
+
+  return(list(
+    data = te_sample_type_filtered,
+    plots = plots
+  ))
 }
 
 replace_nohit_samples <- function(nohits, clinical) {
@@ -250,52 +1017,133 @@ filter_by_metrics <- function(df, metrics_df, column_names, thresholds) {
   return(df)
 }
 
-filter_by_multiple_criteria <- function(df, df_nonproband, df_noconsent, df_hostseqcancer, metrics_df, column_names, thresholds, type) {
+filter_by_multiple_criteria <- function(df, df_nonproband, df_noconsent, df_hostseqcancer, metrics_df, column_names, thresholds, type, export_filtered = TRUE, output_dir = NULL) {
   sample_id_col <- "sample"  # Column containing unique sample identifiers
-  
+
   if (type == "T") {
-    # set up base sample 
+    # set up base sample
     df$base_sample <- df$ID
     df$base_sample <- sub("_T.*", "", df$base_sample)  # Remove "_T" and everything after
     df$base_sample <- sub("_.*", "", df$base_sample)  # Remove "_" and everything after
-    df$base_sample <- sub("-.*", "", df$base_sample) # Remove "-T" and everything after 
+    df$base_sample <- sub("-.*", "", df$base_sample) # Remove "-T" and everything after
   } else {
     df$base_sample <- sub("_N.*", "", df$sample)
   }
-  
+
+  # Initialize tracking dataframe for all samples
+  all_samples <- unique(df[[sample_id_col]])
+  filtered_samples_tracker <- data.frame(
+    sample = all_samples,
+    filter_reason = "Passed",
+    stringsAsFactors = FALSE
+  )
+
   # Step 1: Filter by df_nonproband
   initial_samples <- length(unique(df[[sample_id_col]]))
+  nonproband_samples <- unique(df[[sample_id_col]][df[[sample_id_col]] %in% df_nonproband$V1])
   df_filtered <- filter_by_another_df(df, df_nonproband)
   remaining_samples <- length(unique(df_filtered[[sample_id_col]]))
   filtered_out_nonproband <- initial_samples - remaining_samples
   cat("Filtered out", filtered_out_nonproband, "samples due to non proband normal\n")
-  
+  filtered_samples_tracker$filter_reason[filtered_samples_tracker$sample %in% nonproband_samples] <- "Non-proband"
+
   # Step 2: Filter by df_noconsent
   count_after_nonproband <- remaining_samples
+  noconsent_samples <- unique(df_filtered[[sample_id_col]][df_filtered[[sample_id_col]] %in% df_noconsent$V1])
   df_filtered <- filter_by_another_df(df_filtered, df_noconsent)
   remaining_samples <- length(unique(df_filtered[[sample_id_col]]))
   filtered_out_noconsent <- count_after_nonproband - remaining_samples
   cat("Filtered out", filtered_out_noconsent, "samples due to no consent\n")
-  
+  filtered_samples_tracker$filter_reason[filtered_samples_tracker$sample %in% noconsent_samples] <- "No consent"
+
   # Step 3: Filter by hostseq cancer
   count_after_noconsent <- remaining_samples
+  hostseq_samples <- unique(df_filtered[[sample_id_col]][df_filtered[[sample_id_col]] %in% df_hostseqcancer$V1])
   df_filtered <- filter_by_another_df(df_filtered, df_hostseqcancer)
   remaining_samples <- length(unique(df_filtered[[sample_id_col]]))
   filtered_out_hostseqcancer <- count_after_noconsent - remaining_samples
   cat("Filtered out", filtered_out_hostseqcancer, "samples due to host seq having cancer\n")
-  
-  # Step 4: Filter by metrics_df using multiple columns and thresholds
+  filtered_samples_tracker$filter_reason[filtered_samples_tracker$sample %in% hostseq_samples] <- "HostSeq cancer"
+
+  # Step 3.5: Filter samples with no SNV info
+  no_snv_samples <- c("MDT-AP-0224", "MDT-AP-1110", "MDT-AP-1112", "MDT-AP-2006", "MDT-AP-2897")
   count_after_hostseqcancer <- remaining_samples
-  df_filtered <- filter_by_metrics(df_filtered, metrics_df, column_names, thresholds)
+  # Use pattern matching to handle both tumor (_T) and germline (_N) suffixes
+  no_snv_pattern <- paste0("^(", paste(no_snv_samples, collapse="|"), ")(_T|_N)?$")
+  nosnv_filtered <- unique(df_filtered[[sample_id_col]][grepl(no_snv_pattern, df_filtered[[sample_id_col]])])
+  df_filtered <- df_filtered[!grepl(no_snv_pattern, df_filtered[[sample_id_col]]), ]
   remaining_samples <- length(unique(df_filtered[[sample_id_col]]))
-  filtered_out_metrics <- count_after_hostseqcancer - remaining_samples
+  filtered_out_nosnv <- count_after_hostseqcancer - remaining_samples
+  cat("Filtered out", filtered_out_nosnv, "samples due to no SNV info\n")
+  filtered_samples_tracker$filter_reason[filtered_samples_tracker$sample %in% nosnv_filtered] <- "No SNV info"
+
+  # Step 4: Filter by metrics_df using multiple columns and thresholds
+  count_after_nosnv <- remaining_samples
+  samples_before_metrics <- unique(df_filtered[[sample_id_col]])
+  df_filtered <- filter_by_metrics(df_filtered, metrics_df, column_names, thresholds)
+  samples_after_metrics <- unique(df_filtered[[sample_id_col]])
+  metrics_filtered <- setdiff(samples_before_metrics, samples_after_metrics)
+  remaining_samples <- length(unique(df_filtered[[sample_id_col]]))
+  filtered_out_metrics <- count_after_nosnv - remaining_samples
   cat("Filtered out", filtered_out_metrics, "samples due to metrics with columns\n")
-  
+  filtered_samples_tracker$filter_reason[filtered_samples_tracker$sample %in% metrics_filtered] <- "Failed QC metrics"
+
+  # Export filtered samples with metrics
+  if (export_filtered && !is.null(output_dir)) {
+    filtered_only <- filtered_samples_tracker[filtered_samples_tracker$filter_reason != "Passed", ]
+
+    if (nrow(filtered_only) > 0) {
+      # Merge with metrics data
+      filtered_with_metrics <- merge(filtered_only, metrics_df, by = "sample", all.x = TRUE)
+
+      # For samples that failed QC metrics, specify which metrics failed
+      for (i in seq_along(column_names)) {
+        col <- column_names[i]
+        thresh <- thresholds[i]
+
+        if (col %in% colnames(filtered_with_metrics)) {
+          if (col == "pct_chimeras") {
+            filtered_with_metrics[[paste0(col, "_failed")]] <- filtered_with_metrics[[col]] > thresh
+          } else {
+            filtered_with_metrics[[paste0(col, "_failed")]] <- filtered_with_metrics[[col]] < thresh
+          }
+        }
+      }
+
+      # Update filter_reason for metrics-filtered samples to include which metrics failed
+      for (idx in which(filtered_with_metrics$filter_reason == "Failed QC metrics")) {
+        failed_metrics <- c()
+        for (i in seq_along(column_names)) {
+          col <- column_names[i]
+          fail_col <- paste0(col, "_failed")
+          if (fail_col %in% colnames(filtered_with_metrics) &&
+              !is.na(filtered_with_metrics[[fail_col]][idx]) &&
+              filtered_with_metrics[[fail_col]][idx]) {
+            failed_metrics <- c(failed_metrics, col)
+          }
+        }
+        if (length(failed_metrics) > 0) {
+          filtered_with_metrics$filter_reason[idx] <- paste0("Failed QC: ", paste(failed_metrics, collapse = ", "))
+        }
+      }
+
+      # Write to CSV
+      output_file <- paste0(output_dir, "filtered_samples_with_metrics_", type, ".csv")
+      write.csv(filtered_with_metrics, output_file, row.names = FALSE)
+      cat("Exported filtered samples with metrics to:", output_file, "\n")
+    }
+  }
+
   return(df_filtered)
 }
 
 rename_alt <- function(df) {
-  df <- df %>% rename("ALT" = "SV_type") %>% rename("sample" = "Samples_ID")
+  df <- df %>% rename("ALT" = "SV_type")
+  
+  # Only rename Samples_ID to sample if sample column doesn't already exist
+  if (!"sample" %in% colnames(df) && "Samples_ID" %in% colnames(df)) {
+    df <- df %>% rename("sample" = "Samples_ID")
+  }
   
   # Extract the final field of each ID after splitting by "-"
   last_field <- sapply(strsplit(as.character(df$ID), "-"), function(x) tail(x, 1))
@@ -338,28 +1186,31 @@ replace_df_samples <- function(df, type) {
     }
     
   } else if (type == "N") {
-    # replace sample with patient_sample from ID column 
+    # replace sample with patient_sample from ID column
     df <- df %>%
       mutate(
         sample = sub("_N.*", "_N", ID),  # Update sample to just _N if ID contains _N
         sample = sub("^LFS_", "", sample)  # Remove LFS_ from sample
       )
+
+    # Hardcoded sample name fix
+    df$sample <- ifelse(df$sample == "830_N", "830_1_N", df$sample)
   }
   
   # Return the modified data frame
   return(df)
 }
 
-prep_te<- function(df, df_nonproband, df_noconsent, df_hostseqcancer, df_metrics, column_names, thresholds, type) {
+prep_te<- function(df, df_nonproband, df_noconsent, df_hostseqcancer, df_metrics, column_names, thresholds, type, export_filtered = TRUE, output_dir = NULL) {
   # Step 1: Rename alternative columns
   df <- rename_alt(df)
-  
+
   # Step 2: Replace sample names to match the clinical data
   df <- replace_df_samples(df, type)
-  
+
   # Step 3: Filter by nonproband, noconsent, and metrics criteria
-  df <- filter_by_multiple_criteria(df, df_nonproband, df_noconsent, df_hostseqcancer, df_metrics, column_names, thresholds, type)
-  
+  df <- filter_by_multiple_criteria(df, df_nonproband, df_noconsent, df_hostseqcancer, df_metrics, column_names, thresholds, type, export_filtered, output_dir)
+
   return(df)
 }
 
@@ -378,39 +1229,21 @@ add_gene_size <- function(df) {
   return(as.data.frame(summarized_df))
 }
 
-count_TE_occurrences <- function(te, rare_threshold_percentage) {
-  # Step 1: Count unique samples
-  total_samples <- length(unique(te$sample))
-  
-  # Step 2: Group by TE characteristics and count occurrences per sample
-  te_counts <- te %>%
-    group_by(SV_chrom, SV_start, SV_end, SV_length, SV_type) %>%
-    summarize(unique_samples_in_group = n_distinct(sample)) %>%
-    ungroup()
-  
-  # Step 3: Calculate thresholds for common and rare TEs
-  rare_threshold <- (rare_threshold_percentage / 100) * total_samples
-  common_threshold <- (1 - rare_threshold_percentage / 100) * total_samples
-  
-  # Step 4: Classify TEs
-  num_common_TEs <- nrow(te_counts %>% filter(unique_samples_in_group >= common_threshold))
-  num_rare_TEs <- nrow(te_counts %>% filter(unique_samples_in_group < rare_threshold))
-  num_single_sample_TEs <- nrow(te_counts %>% filter(unique_samples_in_group == 1))
-  
-  # Print the results
-  cat("Number of common TEs (>=", (1 - rare_threshold_percentage / 100) * 100, "% of samples):", num_common_TEs, "\n")
-  cat("Number of rare TEs (<", rare_threshold_percentage, "% of samples):", num_rare_TEs, "\n")
-  cat("Number of TEs in only one sample:", num_single_sample_TEs, "\n")
-  cat("Spread of TEs in samples:", "\n")
-  print(summary(te_counts$unique_samples_in_group))
-}
+count_TE_occurrences<- function(te_expand, te_all, te_all_all, nohits_file, type="N") {
+  # te is each te and only has samples with a te
+  # te_all is sample summary and includes samples without TEs
 
-count_TE_occurrences<- function(te, te_all, nohits, type="N") {
-  # Step 1: Count unique samples
-  num_samples_gt1 <- length(unique(te$sample))
+  # total unique samples
+  num_total_samples <- length(unique(te_all_all$sample)) 
+  
+  # total unique patients
+  num_total_patients <- length(unique(te_all$base_sample))
+
+  # Step 1: Count unique samples with at least one te
+  num_samples_gt1 <- length(unique(te_expand$sample)) 
   
   # Step 2: Group by TE characteristics and count occurrences per sample
-  te_counts <- te %>%
+  te_counts <- te_expand %>%
     group_by(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
     summarize(unique_samples_in_group = n_distinct(sample), .groups = "drop" ) %>%
     ungroup()
@@ -420,16 +1253,29 @@ count_TE_occurrences<- function(te, te_all, nohits, type="N") {
   num_single_sample_TEs <- nrow(te_counts %>% filter(unique_samples_in_group == 1))
   perc_single_sample <- num_single_sample_TEs/total_te*100
   
-  # nohits
+  # Load and count nohits
+  load(paste0(r_dir, nohits_file, ".RData"))
   num_no_hits <- nrow(nohits)
   
   # at least 1 te
-  num_total_samples <- num_samples_gt1 + num_no_hits 
   gt1 <- num_samples_gt1/ num_total_samples*100
   
+  # TP53 counts
+  # Count patients (base_sample level)
+  tp53_counts_patients <- te_all %>%
+    select(base_sample, TP53_status) %>%
+    distinct() %>%
+    count(TP53_status)
+  
+  # Count samples (sample level) - for samples actually in the analysis
+  tp53_counts_samples <- te_all %>%
+    select(sample, TP53_status) %>%
+    distinct() %>%
+    count(TP53_status)
+
   # number of patients with multiple samples
   if (type=="T") {
-    te_sample_counts <- te %>%
+    te_sample_counts <- te_expand %>%
       group_by(base_sample) %>%
       summarise(unique_samples_for_patient = n_distinct(sample), .groups = "drop") %>%
       filter(unique_samples_for_patient > 1) 
@@ -440,9 +1286,14 @@ count_TE_occurrences<- function(te, te_all, nohits, type="N") {
   } 
   
   # Print the results
-  cat("Total number of samples before filtering:", num_total_samples, "\n")
+  cat("Total number of patients:", num_total_patients, "\n")
+  cat("Total number of samples:", num_total_samples, "\n")
+  cat("Number of TP53 patients: \n")
+  print(tp53_counts_patients)
+  cat("Number of TP53 samples: \n")
+  print(tp53_counts_samples)
   cat("Number of samples with 0 TEs:", num_no_hits, "\n")
-  cat("Percent of samples with at least 1 TE:", gt1, "\n")
+  cat("Percent of samples with at least 1 TE:", gt1, "%\n")
   cat("Number of TEs in only one sample:", num_single_sample_TEs, "(", perc_single_sample, "%)\n")
   cat("Spread of number of TEs shared by samples (ie on average the same TE is in 23 samples:", "\n")
   print(summary(te_counts$unique_samples_in_group))
@@ -450,11 +1301,10 @@ count_TE_occurrences<- function(te, te_all, nohits, type="N") {
   print(summary(te_all$ALU))
   cat("Spread of LINE1s by sample:", "\n")
   print(summary(te_all$LINE1))
-  cat("Spread of SVAs by sample:", "\n")
   print(summary(te_all$SVA))
 }
 
-plot_te_counts_summary <- function(df, log_scale=FALSE, breaks=NULL) {
+plot_te_counts_summary <- function(df, y_lab, log_scale=FALSE, breaks=NULL) {
   # Ensure required columns exist
   required_columns <- c("LINE1", "ALU", "SVA")
   if (!all(required_columns %in% colnames(df))) {
@@ -470,7 +1320,7 @@ plot_te_counts_summary <- function(df, log_scale=FALSE, breaks=NULL) {
     geom_boxplot(alpha = 0.7, outlier.shape = NA) +  # Box plot with reduced opacity
     geom_jitter(position = position_jitterdodge(jitter.width = 0.2), color = "black", size = 1.5) +
     scale_fill_manual(values = colour_palette_3) +  # Apply custom fill colors
-    labs(x = "Repeat element", y = "Count") +
+    labs(x = "Repeat type", y = y_lab) +
     theme(legend.position = "none") 
   
   if (log_scale) {
@@ -567,7 +1417,7 @@ stacked_bar_plot_num_samples_4 <- function(te, thresholds = c(1, 3, 10, 50)) {
     geom_bar(stat = "identity") +
     labs(x = "TE type",  
          y = "Number of TEs") +
-    scale_fill_manual(values = color_palette_5,
+    scale_fill_manual(values = colour_palette_5,
                       name = "Samples with TE") 
   
   # Plot with y-axis normalized to proportions
@@ -580,7 +1430,7 @@ stacked_bar_plot_num_samples_4 <- function(te, thresholds = c(1, 3, 10, 50)) {
     geom_bar(stat = "identity") +
     labs(x = "Repeat type",
          y = "Proportion of repeat type") +
-    scale_fill_manual(values = color_palette_5,
+    scale_fill_manual(values = colour_palette_5,
                       name = "Samples with the same repeat")
   
  print(p) 
@@ -820,15 +1670,22 @@ plot_venn <- function(df) {
 }
 
 filter_and_count <- function(df, filter_element = NA, chr = NA) {
-  # Create a complete list of unique samples
-  complete_data <- data.frame(sample = unique(df$sample))
-  
+  # Identify sample-level metadata columns (columns that have same value for each sample)
+  # These are columns we want to preserve in the count matrix
+  sample_cols <- c("sample", "base_sample", "predicted_ancestry_thres", "mapped_label")
+  metadata_cols <- intersect(sample_cols, colnames(df))
+
+  # Get unique sample metadata
+  complete_data <- df %>%
+    dplyr::select(any_of(metadata_cols)) %>%
+    distinct()
+
   # Filter based on 'chr' if applicable
   if (!is.na(chr)) {
-    df <- df %>% 
+    df <- df %>%
       filter(SV_chrom == chr)
   }
-  
+
   # Perform filtering TE type and count occurence by sample
   if (!is.na(filter_element)) {
     filtered_data <- df %>%
@@ -840,23 +1697,23 @@ filter_and_count <- function(df, filter_element = NA, chr = NA) {
       group_by(sample) %>%
       summarise(count = n(), .groups = 'drop')
   }
-  
+
   # Left join to include all samples, with zeros for missing counts
   result <- complete_data %>%
     left_join(filtered_data, by = "sample") %>%
     replace_na(list(count = 0))
-  
+
   return(result)
 }
 
 process_all_combinations <- function(df) {
   # Define the filter elements and chromosome values
   filter_elements <- c(NA, "LINE1", "ALU", "SVA")
-  chromosomes <- c(NA, 1:22, "X", "Y")
-  
+  chromosomes <- c(NA, 1:22, "X", "Y", "MT")
+
   # Initialize an empty list to store results
   results_list <- list()
-  
+
   # Iterate over each filter_element and chromosome combination
   for (filter_element in filter_elements) {
     for (chr in chromosomes) {
@@ -872,22 +1729,36 @@ process_all_combinations <- function(df) {
       } else {
         paste0("chr", chr, "_", filter_element)
       }
-      # save result under specific label
-      result$combination <- combination_label
-      
+      # Safety check before adding combination column
+      if (nrow(result) == 0) {
+        cat("WARNING: Empty result for combination:", combination_label, "\n")
+        # Create properly structured empty result
+        result <- data.frame(sample = character(0), count = integer(0), combination = character(0), stringsAsFactors = FALSE)
+      } else {
+        # save result under specific label
+        result$combination <- combination_label
+      }
+
       # Append the result to the list
       results_list <- append(results_list, list(result))
     }
   }
-  
+
   # Combine all dataframes into one
   combined_result <- bind_rows(results_list)
-  
-  # Pivot the combined result to have combinations as columns
+
+  # Identify metadata columns (non-count columns to preserve)
+  metadata_cols <- setdiff(colnames(combined_result), c("count", "combination"))
+
+  # Pivot the combined result to have combinations as columns, preserving metadata
   wide_result <- combined_result %>%
-    dplyr::select(sample, combination, count) %>%
-    pivot_wider(names_from = combination, values_from = count, values_fill = list(count = 0))
-  
+    pivot_wider(
+      id_cols = all_of(metadata_cols),
+      names_from = combination,
+      values_from = count,
+      values_fill = list(count = 0)
+    )
+
   return(wide_result)
 }
 
@@ -900,19 +1771,30 @@ split_by_gene <- function(df){
 }
 
 # merge with clinical
-merge_dfs <- function(df_te, df_info, include_all_x = FALSE, print_info = TRUE) {
-  # Perform the merge with or without all.x based on the argument
-  all <- merge(df_te, df_info, by = "sample", all.x = include_all_x)
-  
-  # Find samples in df_te that are not in df_info
-  unmatched_merged <- unique(df_te[!df_te$sample %in% df_info$sample, ]$sample)
-  
-  if (print_info) {
-    # Print unmatched samples 
-    print("No info for these samples:")
+merge_dfs <- function(df_te, df_info, include_all_x = FALSE, print_info = TRUE, dataset_name = "unknown") {
+  # If merging with ancestry_tumour and tumor data has base_sample, remove _N from ancestry
+  is_ancestry_tumour <- dataset_name == "ancestry_tumour"
+
+  if (is_ancestry_tumour && "base_sample" %in% colnames(df_te)) {
+    # Remove _N from ancestry samples to match tumor base_sample
+    df_info <- df_info %>%
+      mutate(base_sample = gsub("_N$", "", sample)) %>%
+      select(-sample)
+
+    # Merge on base_sample
+    all <- merge(df_te, df_info, by = "base_sample", all.x = include_all_x)
+    unmatched_merged <- unique(df_te[!df_te$base_sample %in% df_info$base_sample, ]$sample)
+  } else {
+    # Standard merge by sample
+    all <- merge(df_te, df_info, by = "sample", all.x = include_all_x)
+    unmatched_merged <- unique(df_te[!df_te$sample %in% df_info$sample, ]$sample)
+  }
+
+  if (print_info && length(unmatched_merged) > 0) {
+    cat("Samples missing", dataset_name, "info:\n")
     print(unmatched_merged)
   }
-  
+
   return(all)
 }
 
@@ -951,18 +1833,35 @@ six_threshold <- function(df){
 add_nohit_samples <- function(original_data, nohits) {
   # reformat
   new_samples <- as.character(nohits$V1)
-  
+
+  # Print how many samples with no insertions are being added
+  cat("Adding", length(new_samples), "samples with no TE insertions\n")
+
   # Create a new data frame for the new samples with zero counts for TE columns
   new_data <- tibble(sample = new_samples)
-  
-  # Add columns with zero counts for each TE column in the original data (excluding 'sample')
-  for (col in names(original_data)[-1]) {  # Skip the first column ('sample')
-    new_data[[col]] <- 0
+
+  # Add columns with appropriate types for each column in the original data (excluding 'sample')
+  for (col in names(original_data)) {
+    if (col == "sample") next  # Skip sample column, already added
+
+    # Get the column type from original data
+    col_class <- class(original_data[[col]])[1]
+
+    if (col_class %in% c("character", "factor")) {
+      # For character/factor columns, use NA
+      new_data[[col]] <- NA_character_
+    } else if (col_class %in% c("numeric", "double", "integer")) {
+      # For numeric columns, use 0
+      new_data[[col]] <- 0
+    } else {
+      # Default to NA for other types
+      new_data[[col]] <- NA
+    }
   }
-  
+
   # Combine the original data with the new data
   updated_data <- bind_rows(original_data, new_data)
-  
+
   return(updated_data)
 }
 
@@ -985,29 +1884,23 @@ remove_duplicates <- function(df) {
 }
 
 # Function to process and sort TE data
-process_te_data_tumour <- function(te_raw, te_germline=NULL, clinical, nohits_list, metrics_list, 
-                            apply_filter_common = TRUE, rare_gnomad = 3, rare_hostseq = 3, 
+process_te_data_tumour <- function(te_raw, te_germline=NULL, clinical, complete_samples, metrics_list, ancestry,
+                            apply_filter_common = TRUE, rare_gnomad = 3, rare_hostseq = 3,
                             split_by_gene = FALSE,
-                            apply_process_combinations = TRUE, 
-                            select_samples_split = FALSE) {
+                            apply_process_combinations = TRUE,
+                            select_samples_split = FALSE,
+                            nohits_prefix = "default",
+                            nohits_output_dir = NULL
+                            ) {
   
   # Optionally filter common transposable elements
   if (apply_filter_common) {
-    result <- filter_common_hostseq_tumour_te(te_raw, te_germline, rare_gnomad, rare_hostseq)
-    
-    # Check if the result is a list (meaning there are two values returned)
-    if (is.list(result)) {
-      te_filtered <- result$filtered_te_df  # Extract filtered TE dataframe
-      missing_samples <- data.table(V1 = result$missing_samples)  # Extract missing samples, if any
-      nohits_list <- rbind(nohits_list, missing_samples)
-    } else {
-      te_filtered <- result  # If only one value is returned, it's just the filtered TE dataframe
-    }
+    te_filtered <- filter_common_hostseq_tumour_te(te_raw, te_germline, rare_gnomad, rare_hostseq)
   } else {
     te_filtered <- te_raw # dont filter common
   }
   
-  # Optionally split by gene
+  # Optionally split by gene so expand version has one row per gene
   if (split_by_gene) {
     te_split_by_gene <- split_by_gene(te_filtered)
   } else{
@@ -1017,22 +1910,24 @@ process_te_data_tumour <- function(te_raw, te_germline=NULL, clinical, nohits_li
   # Optionally process all combinations
   if (apply_process_combinations) {
     te_processed <- process_all_combinations(te_split_by_gene)
-    te_processed <- add_nohit_samples(te_processed, nohits_list)
+    # Calculate nohits as samples in complete_samples but not in te_processed
+    complete_samples_unique <- unique(complete_samples$V1)
+    te_processed_samples_unique <- unique(te_processed$sample)
+    nohits_samples <- setdiff(complete_samples_unique, te_processed_samples_unique)
+    nohits <- data.table(V1 = nohits_samples)
+    te_processed <- add_nohit_samples(te_processed, nohits)
   } else {
     te_processed <- te_split_by_gene
   }
   
   # merge ancestry
-  #print("merging with ancestry")
-  #te_clinical <- merge_dfs(te_processed, ancestry_list, include_all_x =TRUE, print_info=FALSE)
-  
+  te_with_ancestry <- merge_dfs(te_processed, ancestry, include_all_x =TRUE, print_info=TRUE, dataset_name="ancestry_tumour")
+
   # merge metrics
-  print("merging with metrics")
-  te_clinical <- merge_dfs(te_processed, metrics_list, include_all_x =TRUE, print_info=FALSE)
-  
+  te_clinical <- merge_dfs(te_with_ancestry, metrics_list, include_all_x =TRUE, print_info=TRUE, dataset_name="metrics")
+
   # Merge with clinical data
-  print("merging with clinical")
-  te_clinical <- merge_dfs(te_clinical, clinical, include_all_x = FALSE, print_info=TRUE)
+  te_clinical <- merge_dfs(te_clinical, clinical, include_all_x = FALSE, print_info=TRUE, dataset_name="clinical")
   
   # Remove samples where age at diagnosis is greater than 30
   te_filt <- filter_age(te_clinical)  # Assuming filter_age can accept a max_age parameter
@@ -1043,45 +1938,67 @@ process_te_data_tumour <- function(te_raw, te_germline=NULL, clinical, nohits_li
   # Set factor order
   te_format$TP53_status<- factor(te_format$TP53_status, levels = c("WT", "Mutant"))
   
-  # Sort the data into categories
-  te_aff_df <- te_format %>% filter(tumor_type != "U")  # Cancer samples
+  # Sort the data into categories - exclude Taylor from aff and lfs datasets
+  te_all_df <- te_format  # All samples including Taylor
+  te_aff_df <- te_format %>% filter(tumor_type != "U" & cohort != "Taylor")  # Cancer samples excluding Taylor
   te_lfs_df <- te_format %>%
-    filter(TP53_status == "Mutant") %>%
-    mutate(Cancer = ifelse(tumor_type != "U", "Affected", "Unaffected"))  # LFS samples, with cancer status
-  te_kics_df <- te_aff_df %>% filter(cohort == "KiCS")  # KiCS cohort samples
-  
-  # Optionally select 1 sample for each patient 
+    filter(TP53_status == "Mutant" & cohort != "Taylor") %>%
+    mutate(Cancer = ifelse(tumor_type != "U", "Affected", "Unaffected"))  # LFS samples excluding Taylor
+  te_kics_df <- te_format %>% filter(cohort == "KiCS")  # KiCS cohort samples
+  te_taylor_df <- te_format %>% filter(cohort == "Taylor")  # Taylor-only dataset
+
+  # Optionally select 1 sample for each patient
   if (select_samples_split) {
+    te_all_samples <- select_samples(te_all_df, select_samples_split)
     te_aff_samples <- select_samples(te_aff_df, select_samples_split)
     te_lfs_samples <- select_samples(te_lfs_df, select_samples_split)
     te_kics_samples <- select_samples(te_kics_df, select_samples_split)
-    te_all_sampels <- select_samples(te_format, select_samples_split)
-    
+    te_taylor_samples <- select_samples(te_taylor_df, select_samples_split)
+
     result <- list(
+      te_all_selected = te_all_samples$selected_samples,
+      te_all_all = te_all_samples$all_samples,
       te_aff_selected = te_aff_samples$selected_samples,
       te_aff_all = te_aff_samples$all_samples,
       te_lfs_selected = te_lfs_samples$selected_samples,
       te_lfs_all = te_lfs_samples$all_samples,
       te_kics_selected = te_kics_samples$selected_samples,
       te_kics_all = te_kics_samples$all_samples,
-      te_all_selected = te_all_sampels$selected_samples,
-      te_all_all = te_all_sampels$all_samples
+      te_taylor_selected = te_taylor_samples$selected_samples,
+      te_taylor_all = te_taylor_samples$all_samples
     )
-    
+
   } else {
     # Combine the processed data into a list for easy access
     result <- list(
-      te_all = te_format,
-      te_aff= te_aff_df,
-      te_lfs= te_lfs_df,
-      te_kics= te_kics_df
+      te_all = te_all_df,
+      te_aff = te_aff_df,
+      te_lfs = te_lfs_df,
+      te_kics = te_kics_df,
+      te_taylor = te_taylor_df
     )
+  }
+  
+  # Calculate and save nohits lists for each result dataframe
+  if (apply_process_combinations) {
+    for (name in names(result)) {
+      df <- result[[name]]
+      if ("total" %in% colnames(df)) {
+        nohits_samples <- df[df$total == 0, ]$sample
+        nohits <- data.table(V1 = nohits_samples)
+        save(nohits, file = paste0(r_dir, "nohits_", nohits_prefix, "_", name, "_t.RData"))
+        # Save only te_aff_selected to nohits_output_dir with simplified name
+        if (!is.null(nohits_output_dir) && name == "te_aff_selected") {
+          write.table(nohits, file = paste0(nohits_output_dir, "nohits_te_aff_t.csv"), row.names = FALSE, col.names = FALSE, sep = ",", quote = FALSE)
+        }
+      }
+    }
   }
   
   return(result)
 }
 
-process_te_data_germline <- function(te_raw, clinical, nohits_list, metrics_list, ancestry_list, 
+process_te_data_germline <- function(te_raw, clinical, metrics_list, ancestry_list, 
                             apply_filter_common = TRUE, rare_gnomad = 3, rare_hostseq = 3, 
                             split_by_gene = FALSE,
                             apply_process_combinations = TRUE 
@@ -1092,6 +2009,11 @@ process_te_data_germline <- function(te_raw, clinical, nohits_list, metrics_list
   } else {
     te_filtered <- te_raw
   }
+
+  # Ensure cohort_hs column exists (needed for filtering later)
+  if (!"cohort_hs" %in% colnames(te_filtered)) {
+    te_filtered$cohort_hs <- ifelse(grepl("^HS_", te_filtered$sample), "HostSeq", "Other")
+  }
   
   # Optionally split by gene
   if (split_by_gene) {
@@ -1101,47 +2023,53 @@ process_te_data_germline <- function(te_raw, clinical, nohits_list, metrics_list
   } 
   
   # Optionally process all combinations
+  # dont need to worry about no hits because it germline
   if (apply_process_combinations) {
     te_processed <- process_all_combinations(te_split_by_gene)
-    te_processed <- add_nohit_samples(te_processed, nohits_list)
   } else {
     te_processed <- te_split_by_gene
   }
-  
+
   # merge ancestry
-  print("merging with ancestry")
-  te_clinical <- merge_dfs(te_processed, ancestry_list, include_all_x =TRUE, print_info=FALSE)
-  
+  te_clinical <- merge_dfs(te_processed, ancestry_list, include_all_x =TRUE, print_info=TRUE, dataset_name="ancestry")
+
   # merge metrics
-  print("merging with metrics")
-  te_clinical <- merge_dfs(te_clinical, metrics_list, include_all_x =TRUE, print_info=FALSE)
-  
+  te_clinical <- merge_dfs(te_clinical, metrics_list, include_all_x =TRUE, print_info=TRUE, dataset_name="metrics")
+
   # Merge with clinical data
-  print("merging with clinical")
-  te_clinical <- merge_dfs(te_clinical, clinical, include_all_x = FALSE, print_info=TRUE)
+  te_clinical <- merge_dfs(te_clinical, clinical, include_all_x = FALSE, print_info=TRUE, dataset_name="clinical")
   
   # Remove samples where age at diagnosis is greater than 30
   te_filt <- filter_age(te_clinical)  # Assuming filter_age can accept a max_age parameter
   
   # remove duplicate entries
   te_format <- remove_duplicates(te_filt)
-  
+
   # Set factor order
   te_format$TP53_status<- factor(te_format$TP53_status, levels = c("WT", "Mutant"))
-  
-  # Sort the data into categories
-  te_aff_df <- te_format %>% filter(tumor_type != "U")  # Cancer samples
+
+  # Sort the data into categories - exclude Taylor and HostSeq from aff, lfs, kics datasets
+  te_all_df <- te_format  # All samples including Taylor and HostSeq
+  te_aff_df <- te_format %>% filter(tumor_type != "U" & cohort != "Taylor" & cohort != "HostSeq")  # Cancer samples excluding Taylor and HostSeq
+  te_aff_unaff_df <- te_format %>% filter(cohort != "Taylor" & cohort != "HostSeq")  # Affected + Unaffected (LFS + KICS only, excluding Taylor and HostSeq)
   te_lfs_df <- te_format %>%
-    filter(TP53_status == "Mutant") %>%
-    mutate(Cancer = ifelse(tumor_type != "U", "Affected", "Unaffected"))  # LFS samples, with cancer status
-  te_kics_df <- te_aff_df %>% filter(cohort == "KiCS")  # KiCS cohort samples
-  
+    filter(TP53_status == "Mutant" | cohort %in% c("LFS", "Nick", "SJ")) %>%
+    mutate(Cancer = ifelse(tumor_type != "U", "Affected", "Unaffected"))  # LFS-related samples: TP53 mutant OR from LFS/Nick/SJ cohorts (includes Taylor and HostSeq if they match criteria)
+  te_kics_df <- te_format %>% filter(cohort == "KiCS")  # KiCS cohort samples only
+  te_taylor_df <- te_format %>% filter(cohort == "Taylor")  # Taylor-only dataset
+  te_hostseq_df <- te_format %>% filter(cohort == "HostSeq")  # HostSeq analysis group only
+  te_kics_hostseq_df <- te_format %>% filter(cohort %in% c("KiCS", "HostSeq"))  # KiCS + HostSeq combined
+
   # Combine the processed data into a list for easy access
   result <- list(
-    te_all = te_format,
-    te_aff= te_aff_df,
-    te_lfs= te_lfs_df,
-    te_kics= te_kics_df
+    te_all = te_all_df,
+    te_aff = te_aff_df,
+    te_aff_unaff = te_aff_unaff_df,
+    te_lfs = te_lfs_df,
+    te_kics = te_kics_df,
+    te_taylor = te_taylor_df,
+    te_hostseq = te_hostseq_df,
+    te_kics_hostseq = te_kics_hostseq_df
   )
   
   return(result)
@@ -1198,33 +2126,60 @@ filter_common_TEs <- function(te, rare_threshold_percentage) {
 filter_common_hostseq_tumour_te <- function(te_df, te_germline, rare_gnomad_threshold, rare_hostseq_threshold) {
   # Convert to data.table
   setDT(te_df)
-  setDT(te_germline)
-  
-  # Add cohort column to te_germline
-  te_germline[, cohort_hs := ifelse(grepl("^HS_", sample), "HostSeq", "Other")]
-  
+
   # Convert rare thresholds to decimals
   rare_threshold_gnomad <- rare_gnomad_threshold / 100
   cat("Rare gnomad threshold:", rare_threshold_gnomad, "\n")
-  
+
   rare_threshold_hostseq <- rare_hostseq_threshold / 100
   cat("Rare hostseq threshold:", rare_threshold_hostseq, "\n")
-  
+
   # Count unique TEs in te_df
   unique_te_df_count <- uniqueN(te_df, by = c("SV_chrom", "SV_start", "SV_end", "SV_length", "ALT"))
   cat("Total # of unique TEs in te_df:", unique_te_df_count, "\n")
-  
+
+  # Check if te_germline is NULL or empty
+  if (is.null(te_germline) || nrow(te_germline) == 0) {
+    cat("No germline data provided. Filtering only by GRPMAX_AF threshold.\n")
+    te_df[, SV_chrom := as.character(SV_chrom)]
+    filtered_te_df <- te_df[GRPMAX_AF < rare_threshold_gnomad]
+    unique_filtered_te_df_count <- uniqueN(filtered_te_df, by = c("SV_chrom", "SV_start", "SV_end", "SV_length", "ALT"))
+    cat("Total # of unique TEs after GRPMAX_AF filtering:", unique_filtered_te_df_count, "\n")
+    return(filtered_te_df)
+  }
+
+  setDT(te_germline)
+
+  # Ensure SV_chrom has the same data type in both datasets
+  te_df[, SV_chrom := as.character(SV_chrom)]
+  te_germline[, SV_chrom := as.character(SV_chrom)]
+
+  # Add cohort column to te_germline
+  te_germline[, cohort_hs := ifelse(grepl("^HS_", sample), "HostSeq", "Other")]
+
   # Count unique samples in te_germline for the "HostSeq" cohort
   total_samples_hostseq <- uniqueN(te_germline[cohort_hs == "HostSeq", sample])
   cat("Total # of samples in HostSeq cohort:", total_samples_hostseq, "\n")
-  
+
+  # If no HostSeq samples, only filter by gnomAD
+  if (total_samples_hostseq == 0) {
+    cat("No HostSeq samples found. Filtering only by GRPMAX_AF threshold.\n")
+    filtered_te_df <- te_df[GRPMAX_AF < rare_threshold_gnomad]
+    unique_filtered_te_df_count <- uniqueN(filtered_te_df, by = c("SV_chrom", "SV_start", "SV_end", "SV_length", "ALT"))
+    cat("Total # of unique TEs after GRPMAX_AF filtering:", unique_filtered_te_df_count, "\n")
+    return(filtered_te_df)
+  }
+
+  # Ensure ALT is character not list
+  te_germline[, ALT := as.character(ALT)]
+
   # Group te_germline to calculate filtering flags
   te_with_flags_germline <- te_germline[
-    cohort_hs == "HostSeq", 
+    cohort_hs == "HostSeq",
     .(
       unique_samples_in_group_hostseq = uniqueN(sample) # Count unique samples in HostSeq
     ),
-    by = .(SV_chrom, SV_start, SV_end, SV_length, ALT)
+    by = list(SV_chrom, SV_start, SV_end, SV_length, ALT)
   ]
   
   # Add the is_common_hostseq flag
@@ -1251,9 +2206,9 @@ filter_common_hostseq_tumour_te <- function(te_df, te_germline, rare_gnomad_thre
     which = TRUE
   ]
   
-  # Remove NA indices
-  overlapping_indices <- na.omit(overlapping_indices)
-  
+  # Remove NA indices and duplicates
+  overlapping_indices <- unique(na.omit(overlapping_indices))
+
   filtered_by_common_te_df <- te_df[-overlapping_indices]
   
   # Filter te_df by GRPMAX_AF threshold
@@ -1269,25 +2224,27 @@ filter_common_hostseq_tumour_te <- function(te_df, te_germline, rare_gnomad_thre
   percent_filtered_by_common <- (num_filtered_by_common / unique_te_df_count) * 100
   percent_filtered_by_AF <- (num_filtered_by_AF / unique_te_df_count) * 100
   
-  # Print filtered stats
+  # Calculate total insertions removed
+  total_te_insertions_input <- nrow(te_df)
+  total_te_insertions_output <- nrow(filtered_te_df)
+  total_insertions_removed <- total_te_insertions_input - total_te_insertions_output
+  percent_insertions_removed <- (total_insertions_removed / total_te_insertions_input) * 100
+  
+  # Calculate insertions removed by each step
+  insertions_after_common_filter <- nrow(filtered_by_common_te_df)
+  insertions_removed_by_common <- total_te_insertions_input - insertions_after_common_filter
+  insertions_removed_by_AF <- insertions_after_common_filter - total_te_insertions_output
+  
+  # Print detailed filtering stats
+  cat("FILTERING SUMMARY (Unique TE Loci):\n")
   cat("Filtered by common TEs:", num_filtered_by_common, "(", round(percent_filtered_by_common, 2), "%)\n")
   cat("Filtered by GRPMAX_AF:", num_filtered_by_AF, "(", round(percent_filtered_by_AF, 2), "%)\n")
+  cat("FILTERING SUMMARY (Total TE Insertions):\n")
+  cat("Total insertions removed:", total_insertions_removed, "of", total_te_insertions_input, "(", round(percent_insertions_removed, 2), "%)\n")
+  cat("Insertions removed by common overlap:", insertions_removed_by_common, "\n")
+  cat("Insertions removed by GRPMAX_AF:", insertions_removed_by_AF, "\n")
   
-  # Check for missing samples after filtering
-  original_samples <- unique(te_df$sample)
-  remaining_samples <- unique(filtered_te_df$sample)
-  missing_samples <- setdiff(original_samples, remaining_samples)
-  
-  if (length(missing_samples) > 0) {
-    cat("Samples lost after filtering common TEs:", missing_samples, "\n")
-    
-    return(list(filtered_te_df = filtered_te_df, missing_samples = missing_samples))
-    
-  } else {
-    cat("No samples were lost after filtering common TEs.\n")
-    
-    return(filtered_te_df)
-  }
+  return(filtered_te_df)
 }
 
 filter_common_hostseq_germline_te <- function(te, rare_gnomad_threshold, rare_hostseq_threshold) {
@@ -1309,24 +2266,37 @@ filter_common_hostseq_germline_te <- function(te, rare_gnomad_threshold, rare_ho
   total_samples <- length(unique(te$sample))
   cat("Total # samples:", total_samples, "\n")
   
-  # total samples for hostseq 
-  total_samples_hostseq <- length(unique(te$sample[te$cohort_hs == "HostSeq"]))
-  cat("Total # samples for cohort 'HostSeq':", total_samples_hostseq, "\n")
-  
+  # total samples for hostseq - ONLY use filter group for calculations
+  # Check if hostseq_group column exists (new method)
+  if ("hostseq_group" %in% colnames(te)) {
+    total_samples_hostseq <- length(unique(te$sample[te$hostseq_group == "filter"]))
+    cat("Total # samples for HostSeq FILTER group:", total_samples_hostseq, "\n")
+  } else {
+    # Fallback to old method (all HostSeq)
+    total_samples_hostseq <- length(unique(te$sample[te$cohort_hs == "HostSeq"]))
+    cat("Total # samples for cohort 'HostSeq' (all):", total_samples_hostseq, "\n")
+    cat("Warning: hostseq_group column not found, using all HostSeq samples\n")
+  }
+
   # total tes
   total_te_df <- nrow(te)
   cat("Total # TEs called in df:", total_te_df, "\n")
-    
+
   # Group by TE characteristics and calculate thresholds for filtering
+  # ONLY count samples from HostSeq filter group
   te_with_flags <- te %>%
     group_by(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
     summarise(
-      # Count unique samples from HostSeq cohort
-      unique_samples_in_group_hostseq = n_distinct(sample[cohort_hs == "HostSeq"]),
-      
+      # Count unique samples from HostSeq FILTER cohort only
+      unique_samples_in_group_hostseq = if ("hostseq_group" %in% colnames(cur_data())) {
+        n_distinct(sample[hostseq_group == "filter"])
+      } else {
+        n_distinct(sample[cohort_hs == "HostSeq"])
+      },
+
       # Calculate the filtering conditions
-      exceeds_AF_threshold = any(GRPMAX_AF >= rare_threshold_gnomad),  # At least one sample exceeds the AF threshold in the group
-      is_common_hostseq = unique_samples_in_group_hostseq / total_samples_hostseq >= rare_threshold_hostseq,  # Common condition based on HostSeq samples
+      exceeds_AF_threshold = any(GRPMAX_AF >= rare_threshold_gnomad, na.rm = TRUE),  # At least one sample exceeds the AF threshold in the group
+      is_common_hostseq = unique_samples_in_group_hostseq / total_samples_hostseq >= rare_threshold_hostseq,  # Common condition based on HostSeq FILTER samples only
       .groups = "keep"
     ) 
   
@@ -1334,7 +2304,7 @@ filter_common_hostseq_germline_te <- function(te, rare_gnomad_threshold, rare_ho
   total_unique_te <- nrow(te_with_flags)
   cat("Total # of unique TEs:", total_unique_te, "\n")
   
-  # Calculate the counts for each filter condition
+  # Calculate the counts for each filter condition (unique loci)
   num_filtered_by_AF <- sum(te_with_flags$exceeds_AF_threshold)
   num_filtered_by_common <- sum(te_with_flags$is_common_hostseq)
   num_overlap_filters <- sum(te_with_flags$is_common_hostseq & te_with_flags$exceeds_AF_threshold) # overlap between two filters
@@ -1346,21 +2316,51 @@ filter_common_hostseq_germline_te <- function(te, rare_gnomad_threshold, rare_ho
     filter(is_common_hostseq == FALSE, exceeds_AF_threshold == FALSE) %>%  # Keep only uncommon and below threshold
     dplyr::select(-is_common_hostseq, -exceeds_AF_threshold)  # Remove helper columns
   
-  # Calculate the percentage filtered by each condition and by the overlap
+  # Calculate insertions removed (before vs after filtering)
+  total_insertions_removed <- total_te_df - nrow(uncommon_TEs)
+  
+  # Calculate insertions removed by each filter condition
+  insertions_filtered_by_AF <- te %>%
+    left_join(te_with_flags %>% select(SV_chrom, SV_start, SV_end, SV_length, ALT, exceeds_AF_threshold), 
+              by = c("SV_chrom", "SV_start", "SV_end", "SV_length", "ALT")) %>%
+    filter(exceeds_AF_threshold == TRUE) %>% nrow()
+  
+  insertions_filtered_by_common <- te %>%
+    left_join(te_with_flags %>% select(SV_chrom, SV_start, SV_end, SV_length, ALT, is_common_hostseq), 
+              by = c("SV_chrom", "SV_start", "SV_end", "SV_length", "ALT")) %>%
+    filter(is_common_hostseq == TRUE) %>% nrow()
+  
+  # Calculate the percentage filtered by each condition (unique loci)
   percent_filtered_by_AF <- (num_filtered_by_AF / total_unique_te) * 100
   percent_filtered_by_common <- (num_filtered_by_common / total_unique_te) * 100
   percent_overlap_filters <- (num_overlap_filters / total_unique_te) * 100
   
-  # Print messages
-  cat("Filtered by GRPMAX_AF:", num_filtered_by_AF, "(", round(percent_filtered_by_AF, 2), "%)\n")
-  cat("Filtered by is_common_hostseq:", num_filtered_by_common, "(", round(percent_filtered_by_common, 2), "%)\n")
-  cat("Filtered by both (overlap):", num_overlap_filters, "(", round(percent_overlap_filters, 2), "%)\n")
+  # Calculate percentage of total insertions removed
+  percent_insertions_removed <- (total_insertions_removed / total_te_df) * 100
   
+  # Print messages with both unique loci and total insertions
+  cat("FILTERING SUMMARY (Unique TE Loci):\n")
+  cat("Filtered by common TEs:", num_filtered_by_common, "(", round(percent_filtered_by_common, 2), "%)\n")
+  cat("Filtered by GRPMAX_AF:", num_filtered_by_AF, "(", round(percent_filtered_by_AF, 2), "%)\n")
+  cat("Filtered by both (overlap):", num_overlap_filters, "(", round(percent_overlap_filters, 2), "%)\n")
+  cat("FILTERING SUMMARY (Total TE Insertions):\n")
+  cat("Total insertions removed:", total_insertions_removed, "of", total_te_df, "(", round(percent_insertions_removed, 2), "%)\n")
+  cat("Insertions at loci with high GRPMAX_AF:", insertions_filtered_by_AF, "\n")
+  cat("Insertions at common HostSeq loci:", insertions_filtered_by_common, "\n")
+
+  # Remove HostSeq filter group samples (they were only used for frequency calculations)
+  if ("hostseq_group" %in% colnames(uncommon_TEs)) {
+    n_before <- nrow(uncommon_TEs)
+    uncommon_TEs <- uncommon_TEs %>% filter(hostseq_group != "filter" | is.na(hostseq_group))
+    n_removed <- n_before - nrow(uncommon_TEs)
+    cat("Removed", n_removed, "HostSeq filter group TEs (kept analysis group)\n")
+  }
+
   # Check missing samples in uncommon_TEs
   original_samples <- unique(te$sample)  # List of original samples
   remaining_samples <- unique(uncommon_TEs$sample)  # Samples left after filtering
   missing_samples <- setdiff(original_samples, remaining_samples)  # Find missing samples
-  
+
   if (length(missing_samples) > 0) {
     cat("Samples lost after filtering common TEs:", missing_samples)
   } else {
@@ -1377,40 +2377,50 @@ select_samples <- function(df, select_samples_split = FALSE) {
   }
   
   # Define ranking for lesion_type and disease_state
-  lesion_rank <- c("primary" = 1, "metastasis" = 2)
-  disease_rank <- c("initial" = 1, "progressive" = 2, "relapsed" = 3)
+  lesion_rank <- c("primary" = 1, "metastasis" = 2, "relapse" = 2, "unknown" = 3)
+  disease_rank <- c("initial" = 1, "progressive" = 2, "relapsed" = 3, "relapse" = 3, "unknown" = 4)
   
-  # Handle NA as the lowest priority
+  # Handle NA and empty string as the lowest priority
   lesion_rank <- c(lesion_rank, "NA" = max(lesion_rank) + 1)
   disease_rank <- c(disease_rank, "NA" = max(disease_rank) + 1)
   
   # Assign lesion_rank
   df$lesion_rank <- ifelse(
-    is.na(df$lesion_type) | df$lesion_type == "NA" | !(df$lesion_type %in% names(lesion_rank)),
+    is.na(df$lesion_type) | df$lesion_type == "NA" | df$lesion_type == "" | !(df$lesion_type %in% names(lesion_rank)),
     lesion_rank["NA"],
     lesion_rank[df$lesion_type]
   )
   # Assign disease_rank
   df$disease_rank <- ifelse(
-    is.na(df$disease_state) | df$disease_state == "NA" | !(df$disease_state %in% names(disease_rank)),
+    is.na(df$disease_state) | df$disease_state == "NA" | df$disease_state == "" | !(df$disease_state %in% names(disease_rank)),
     disease_rank["NA"],
     disease_rank[df$disease_state]
   )
   
   # Identify invalid lesion_type and disease_state values and their rows
-  invalid_lesion_rows <- df[!(is.na(df$lesion_type)) & !(df$lesion_type %in% names(lesion_rank)), ]
-  invalid_disease_rows <- df[!(is.na(df$disease_state)) & !(df$disease_state %in% names(disease_rank)), ]
+  # Only include values that are not NA, not empty, and not in the ranking
+  lesion_mask <- !is.na(df$lesion_type) & df$lesion_type != "" & !(df$lesion_type %in% names(lesion_rank))
+  disease_mask <- !is.na(df$disease_state) & df$disease_state != "" & !(df$disease_state %in% names(disease_rank))
   
-  # Print warning for invalid lesion_type values
+  invalid_lesion_rows <- df[lesion_mask, ]
+  invalid_disease_rows <- df[disease_mask, ]
+  
+  # Print warning for invalid lesion_type values only if there are actual problematic values
   if (nrow(invalid_lesion_rows) > 0) {
-    warning("The following lesion_type values and corresponding samples do not match any keys in lesion_rank:\n")
-    print(invalid_lesion_rows[, c("sample", "lesion_type")])  # Print only sample and lesion_type columns
+    unique_invalid_lesion <- unique(invalid_lesion_rows$lesion_type)
+    if (length(unique_invalid_lesion) > 0) {
+      warning("The following lesion_type values do not match any keys in lesion_rank: ", 
+              paste(unique_invalid_lesion, collapse = ", "))
+    }
   }
   
-  # Print warning for invalid disease_state values
+  # Print warning for invalid disease_state values only if there are actual problematic values
   if (nrow(invalid_disease_rows) > 0) {
-    warning("The following disease_state values and corresponding samples do not match any keys in disease_rank:\n")
-    print(invalid_disease_rows[, c("sample", "disease_state")])  # Print only sample and disease_state columns
+    unique_invalid_disease <- unique(invalid_disease_rows$disease_state)
+    if (length(unique_invalid_disease) > 0) {
+      warning("The following disease_state values do not match any keys in disease_rank: ", 
+              paste(unique_invalid_disease, collapse = ", "))
+    }
   }
   
   # Select appropriate logic based on `select_samples_split`
@@ -1674,15 +2684,23 @@ plot_count_wilcox <- function(df, chr, type, group, x_lab, y_lab, log_scale = FA
     df <- df %>% filter(!is.na(!!sym(group)))
   }
   
-  # Print p-value from Wilcoxon test
-  print("dependent ~ independent")
-  formula <- reformulate(group, combination)
-  print(formula)
-  p_value <- wilcox.test(formula, data = df)$p.value
-  print(paste("Wilcoxon test p-value:", p_value))
-  
-  # Format the p-value for display
-  p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  # Check if grouping factor has exactly 2 levels for Wilcoxon test
+  unique_groups <- unique(df[[group]])
+  if (length(unique_groups) != 2) {
+    cat(paste("Warning: Grouping factor has", length(unique_groups), "levels:", paste(unique_groups, collapse=", "), "\n"))
+    cat("Wilcoxon test requires exactly 2 groups. Skipping statistical test.\n")
+    p_value <- NA
+    p_value_formatted <- "N/A"
+  } else {
+    # Print p-value from Wilcoxon test
+    print("dependent ~ independent")
+    formula <- reformulate(group, combination)
+    print(formula)
+    p_value <- wilcox.test(formula, data = df)$p.value
+    print(paste("Wilcoxon test p-value:", p_value))
+    # Format the p-value for display
+    p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  }
   
   # Calculate and print medians for each group
   medians <- df %>%
@@ -1690,13 +2708,29 @@ plot_count_wilcox <- function(df, chr, type, group, x_lab, y_lab, log_scale = FA
     summarise(median_count = median(!!sym(combination), na.rm = TRUE))
   print(medians)
   
+  # Choose appropriate color palette based on number of groups
+  n_groups <- length(unique_groups)
+  if (n_groups <= 2) {
+    color_palette <- colours
+  } else if (n_groups == 3) {
+    color_palette <- colours_3
+  } else {
+    # For more than 3 groups, use a default palette
+    color_palette <- rainbow(n_groups)
+  }
+  
   # Plot with optional log scale
-  plot <- plot_box(df, combination, group, x_lab, y_lab, colours, log_scale) + 
-    geom_signif(test = "wilcox.test", 
-                comparisons = list(levels(factor(df[[group]]))),
-                map_signif_level = TRUE,
-                textsize = 5) + 
-    coord_cartesian(clip = 'off') # dont cut off annotation
+  plot <- plot_box(df, combination, group, x_lab, y_lab, color_palette, log_scale)
+  
+  # Add statistical annotations only if we have exactly 2 groups
+  if (length(unique_groups) == 2) {
+    plot <- plot + 
+      geom_signif(test = "wilcox.test", 
+                  comparisons = list(levels(factor(df[[group]]))),
+                  map_signif_level = TRUE,
+                  textsize = 5) + 
+      coord_cartesian(clip = 'off') # dont cut off annotation
+  }
   
   return(plot)
 }
@@ -1983,7 +3017,7 @@ plot_count_lasso <- function(df, chr, type, group, covariates, x_lab, y_lab, log
   return(plot)
 }
 
-plot_count_lm <- function(df, chr, type, group, covariates, x_lab, y_lab, residuals = FALSE, log_scale = FALSE, breaks=NULL, min_samples = 5) {
+plot_count_lm <- function(df, chr, type, group, covariates, x_lab, y_lab, residuals = FALSE, log_scale = FALSE, breaks=NULL, min_samples = 5, fill_palette = NULL) {
   # Use the helper function to construct the combination label
   combination <- construct_combination_label(chr, type)
   print(table(df[[group]]))
@@ -2054,10 +3088,24 @@ plot_count_lm <- function(df, chr, type, group, covariates, x_lab, y_lab, residu
     
   } else {
     # Approach 2: Analyze group effect in the linear model
-    dummy_var <- grep(paste0("^", group), rownames(coef(lm_summary)), value = TRUE)
-    group_p_value <- coef(lm_summary)[dummy_var, "Pr(>|t|)"]
-    print(paste("p-value for", group, ":", group_p_value))
-    
+    # Print the full linear model summary to see pairwise comparisons vs reference group
+    cat("\n=== LINEAR MODEL SUMMARY ===\n")
+    cat("Coefficients (each group compared to reference group):\n")
+    print(coef(lm_summary))
+    cat("\n")
+
+    # Print ANOVA table to see overall F-test for each variable
+    cat("=== ANOVA TABLE (F-tests for overall effect of each variable) ===\n")
+    anova_result <- anova(lm_model)
+    print(anova_result)
+    cat("\n")
+
+    # Use ANOVA F-test to get overall group effect p-value for plot
+    # This tests: "Do ANY of the groups differ?" (works for both 2-level and multi-level groups)
+    group_p_value <- anova_result[group, "Pr(>F)"]
+    cat("Using overall ANOVA F-test p-value for", group, ":", group_p_value, "\n")
+    cat("(This tests whether ANY groups differ, adjusting for all covariates)\n\n")
+
     # Format the p-value for display
     p_value_formatted <- formatC(group_p_value, format = "e", digits = 2)
     
@@ -2068,13 +3116,19 @@ plot_count_lm <- function(df, chr, type, group, covariates, x_lab, y_lab, residu
     print(medians)
     
     # Plot the group effect
+    # Use provided palette or default to colour_palette_4
+    if (is.null(fill_palette)) {
+      fill_palette <- colour_palette_4
+    }
+
     p <- ggplot(df, aes(x = .data[[group]], y = !!sym(combination), fill = .data[[group]])) +
       geom_boxplot(outlier.shape = NA, color = "black") +
-      scale_fill_manual(values = colours_3, guide = "none") +
+      scale_fill_manual(values = fill_palette, guide = "none") +
       geom_jitter(color = "black", size = 1.5, width = 0.2) +
       labs(x = x_lab, y = y_lab) +
       annotate("text", x = 1.7, y = max(df[[combination]], na.rm = TRUE),
-               label = paste("p =", p_value_formatted), hjust = 0) 
+               label = paste("p =", p_value_formatted), hjust = 0) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
     
     if (log_scale) {
       p <- p + scale_y_continuous(
@@ -2149,8 +3203,8 @@ bootstrap_test <- function(df, column, value_col, test_function, n_bootstraps = 
   plot_data <- data.frame(bootstrap_stats = bootstrap_stats)
   p_bootstrap <- ggplot(plot_data, aes(x = bootstrap_stats)) +
     geom_histogram(bins = 30, fill = "#5FBFF9", color = "black", alpha = 0.7) +
-    geom_vline(xintercept = observed_stat, color = "red", size = 1, linetype = "solid") +
-    labs(title = "Bootstrap Distribution of Test Statistics",
+    geom_vline(xintercept = observed_stat, color = "red", linewidth = 1, linetype = "solid") +
+    labs(
          x = "Test Statistic",
          y = "Frequency")
   
@@ -2159,9 +3213,9 @@ bootstrap_test <- function(df, column, value_col, test_function, n_bootstraps = 
   # Plot the p-value convergence
   convergence_data <- data.frame(bootstrap_sizes = bootstrap_sizes, p_values = p_value_convergence)
   p_convergence <- ggplot(convergence_data, aes(x = bootstrap_sizes, y = p_values)) +
-    geom_line(color = "blue", size = 1) +
+    geom_line(color = "blue", linewidth = 1) +
     geom_point(color = "blue") +
-    labs(title = "Convergence of P-value with Number of Bootstraps",
+    labs(
          x = "Number of Bootstraps",
          y = "P-value") 
   
@@ -2314,11 +3368,22 @@ plot_count_kruskal <- function(df, chr=NA, type=NA, group, x_lab, y_lab, x_order
     df <- df %>% filter(!is.na(!!sym(group)))
   }
   
-  # Perform Kruskal-Wallis test
-  test_result <- kruskal.test(reformulate(group, combination), data = df)
-  p_value <- test_result$p.value
-  p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  # Check if there are at least 2 groups for Kruskal-Wallis test
+  unique_groups <- unique(df[[group]])
+  unique_groups <- unique_groups[!is.na(unique_groups)]
   
+  if (length(unique_groups) < 2) {
+    cat("Kruskal-Wallis test requires at least 2 groups. Column:", group, "has", length(unique_groups), "unique value(s):", paste(unique_groups, collapse = ", "), ". Skipping statistical test.\n")
+    p_value <- NA
+    p_value_formatted <- "NA"
+  } else {
+    # Perform Kruskal-Wallis test
+    test_result <- kruskal.test(reformulate(group, combination), data = df)
+    p_value <- test_result$p.value
+    p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+    print(p_value)
+  }
+
   # Calculate and print medians for each group
   medians <- df %>%
     group_by(!!sym(group)) %>%
@@ -2347,7 +3412,7 @@ plot_box_kruskal<- function(df, count_y, group, xlab, y_lab, x_order = NULL, log
   
   plot <- ggplot(df_clean, aes(x = !!sym(group), y = !!sym(count_y), fill = !!sym(group))) +
     geom_boxplot(outlier.shape = NA) + 
-    scale_fill_manual(values =  colour_palette_3) + #mutation_colours
+    scale_fill_manual(values =  color_palette_6) + #mutation_colours
     geom_jitter(position=position_jitterdodge(jitter.width=0.2), color = "black", size = 1.5) +
     labs(x = xlab, y = y_lab) + 
     guides(fill="none") + 
@@ -2365,6 +3430,255 @@ plot_box_kruskal<- function(df, count_y, group, xlab, y_lab, x_order = NULL, log
     )
   }
   return(plot)
+}
+
+# Faceted version of plot_count_kruskal by ancestry
+# Creates separate panels for each ancestry group with individual Kruskal-Wallis tests
+plot_count_kruskal_facet_ancestry <- function(df, chr=NA, type=NA, group, x_lab, y_lab,
+                                              x_order = NULL, log_scale = FALSE, breaks=NULL,
+                                              ancestry_col = "predicted_ancestry_thres") {
+  # Use the helper function to construct the combination label
+  combination <- construct_combination_label(chr, type)
+
+  # Check if ancestry column exists
+  if (!ancestry_col %in% colnames(df)) {
+    cat("Warning: Ancestry column '", ancestry_col, "' not found in dataframe. Cannot create faceted plot.\n", sep="")
+    return(NULL)
+  }
+
+  # Remove rows with NA in group or ancestry columns
+  df_clean <- df %>%
+    filter(!is.na(!!sym(group)), !is.na(!!sym(ancestry_col)))
+
+  if (nrow(df_clean) == 0) {
+    cat("Warning: No data remaining after removing NA values. Cannot create faceted plot.\n")
+    return(NULL)
+  }
+
+  # Calculate Kruskal-Wallis test p-values for each ancestry group
+  ancestry_groups <- unique(df_clean[[ancestry_col]])
+  p_values_df <- data.frame()
+
+  for (anc in ancestry_groups) {
+    df_anc <- df_clean %>% filter(!!sym(ancestry_col) == anc)
+    unique_groups <- unique(df_anc[[group]])
+    unique_groups <- unique_groups[!is.na(unique_groups)]
+
+    if (length(unique_groups) >= 2) {
+      test_result <- kruskal.test(reformulate(group, combination), data = df_anc)
+      p_value <- test_result$p.value
+      p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+    } else {
+      p_value_formatted <- "NA"
+    }
+
+    p_values_df <- rbind(p_values_df, data.frame(
+      ancestry = anc,
+      p_value = p_value_formatted,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  # Print p-values for each ancestry group
+  cat("\nKruskal-Wallis p-values by ancestry:\n")
+  print(p_values_df)
+
+  # Rename ancestry column in p_values_df to match the actual column name
+  # This ensures geom_text properly matches p-values to facets
+  colnames(p_values_df)[1] <- ancestry_col
+
+  # Calculate and print medians for each group x ancestry combination
+  medians <- df_clean %>%
+    group_by(!!sym(ancestry_col), !!sym(group)) %>%
+    summarise(median_count = median(!!sym(combination), na.rm = TRUE), .groups = "drop")
+  cat("\nMedians by ancestry and group:\n")
+  print(medians)
+
+  # Create base plot with faceting
+  plot <- plot_box_kruskal_facet_ancestry(df_clean, combination, group = group,
+                                          ancestry_col = ancestry_col,
+                                          xlab = x_lab, y_lab = y_lab,
+                                          x_order = x_order, log_scale = log_scale)
+
+  # Add p-values as text annotations for each facet (only for non-NA values)
+  # Position at top right of each panel
+  p_values_df_valid <- p_values_df[p_values_df$p_value != "NA", ]
+  if (nrow(p_values_df_valid) > 0) {
+    plot <- plot +
+      geom_text(data = p_values_df_valid,
+                aes(x = Inf, y = Inf, label = paste("p =", p_value)),
+                inherit.aes = FALSE,
+                vjust = 2, hjust = 1.1, size = 3)
+  }
+
+  # Apply logarithmic scale if log_scale is TRUE
+  if (log_scale) {
+    plot <- plot + scale_y_continuous(
+      trans = scales::log1p_trans(),
+      breaks = if (!is.null(breaks)) breaks else waiver()
+    )
+  }
+
+  return(plot)
+}
+
+# Helper function for faceted boxplot by ancestry
+plot_box_kruskal_facet_ancestry <- function(df, count_y, group, ancestry_col, xlab, y_lab,
+                                           x_order = NULL, log_scale = FALSE) {
+  # Filter out non-finite values
+  df_clean <- df %>% filter(is.finite(!!sym(count_y)))
+
+  # Rename ancestry column for plotting (assign within aes)
+  plot <- ggplot(df_clean, aes(x = !!sym(group), y = !!sym(count_y), fill = !!sym(group))) +
+    geom_boxplot(outlier.shape = NA) +
+    scale_fill_manual(values = color_palette_6) +
+    geom_jitter(position=position_jitterdodge(jitter.width=0.2), color = "black", size = 1.5) +
+    labs(x = xlab, y = y_lab) +
+    guides(fill="none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_wrap(as.formula(paste("~", ancestry_col)), scales = "free_x")
+
+  # Apply custom order for x-axis if provided
+  if (!is.null(x_order)) {
+    plot <- plot + scale_x_discrete(limits = x_order)
+  }
+
+  # Apply logarithmic scale if log_scale is TRUE
+  if (log_scale) {
+    plot <- plot + scale_y_continuous(
+      trans = scales::log1p_trans()
+    )
+  }
+
+  return(plot)
+}
+
+# Faceted version of plot_count_lm by ancestry
+# Creates separate panels for each ancestry group with individual linear model tests
+plot_count_lm_facet_ancestry <- function(df, chr, type, group, covariates, x_lab, y_lab,
+                                         residuals = FALSE, log_scale = FALSE, breaks = NULL,
+                                         min_samples = 5, fill_palette = NULL,
+                                         ancestry_col = "predicted_ancestry_thres") {
+  # Use the helper function to construct the combination label
+  combination <- construct_combination_label(chr, type)
+
+  # Check if ancestry column exists
+  if (!ancestry_col %in% colnames(df)) {
+    cat("Warning: Ancestry column '", ancestry_col, "' not found in dataframe. Cannot create faceted plot.\n", sep="")
+    return(NULL)
+  }
+
+  # Check if there are any NA values in the required columns
+  all_vars <- c(group, covariates, ancestry_col)
+  if (anyNA(df[all_vars])) {
+    cat("Data contains NA values in group, covariates, or ancestry. Excluding rows with NA values.\n")
+    df <- df %>% filter(complete.cases(df[all_vars]))
+  }
+
+  if (nrow(df) == 0) {
+    cat("Warning: No data remaining after removing NA values. Cannot create faceted plot.\n")
+    return(NULL)
+  }
+
+  # Aggregate rare tumor types
+  df <- df %>%
+    group_by(tumor_type) %>%
+    mutate(tumor_type = ifelse(n() < min_samples, "Other", tumor_type)) %>%
+    ungroup()
+
+  # Ensure group is a factor
+  df[[group]] <- factor(df[[group]])
+
+  # Calculate linear model p-values for each ancestry group
+  ancestry_groups <- unique(df[[ancestry_col]])
+  p_values_df <- data.frame()
+
+  cat("\n=== LINEAR MODEL RESULTS BY ANCESTRY ===\n")
+  for (anc in ancestry_groups) {
+    df_anc <- df %>% filter(!!sym(ancestry_col) == anc)
+
+    cat("\n--- Ancestry:", anc, "---\n")
+    cat("Sample sizes:\n")
+    print(table(df_anc[[group]]))
+
+    # Initialize p_value_formatted
+    p_value_formatted <- "NA"
+
+    # Construct the formula for the linear model
+    formula <- as.formula(
+      paste(combination, "~", if (residuals) paste(covariates, collapse = "+") else paste(group, "+", paste(covariates, collapse = "+")))
+    )
+
+    # Fit the linear model
+    tryCatch({
+      lm_model <- lm(formula, data = df_anc)
+      lm_summary <- summary(lm_model)
+      anova_result <- anova(lm_model)
+
+      # Get overall ANOVA F-test p-value for the group
+      if (!residuals && group %in% rownames(anova_result)) {
+        group_p_value <- anova_result[group, "Pr(>F)"]
+        p_value_formatted <<- formatC(group_p_value, format = "e", digits = 2)
+        cat("ANOVA p-value for", group, ":", p_value_formatted, "\n")
+      } else {
+        p_value_formatted <<- "NA"
+        cat("Could not calculate p-value\n")
+      }
+
+      # Calculate medians
+      medians <- df_anc %>%
+        group_by(.data[[group]]) %>%
+        summarise(median_count = median(!!sym(combination), na.rm = TRUE))
+      cat("Medians:\n")
+      print(medians)
+
+    }, error = function(e) {
+      cat("Error fitting model:", e$message, "\n")
+    })
+
+    p_values_df <- rbind(p_values_df, data.frame(
+      ancestry = anc,
+      p_value = p_value_formatted,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  # Rename ancestry column in p_values_df to match the actual column name
+  colnames(p_values_df)[1] <- ancestry_col
+
+  # Use provided palette or default to color_palette_6 (same as Kruskal plots)
+  if (is.null(fill_palette)) {
+    fill_palette <- color_palette_6
+  }
+
+  # Create faceted plot
+  p <- ggplot(df, aes(x = .data[[group]], y = !!sym(combination), fill = .data[[group]])) +
+    geom_boxplot(outlier.shape = NA, color = "black") +
+    scale_fill_manual(values = fill_palette, guide = "none") +
+    geom_jitter(color = "black", size = 1.5, width = 0.2) +
+    labs(x = x_lab, y = y_lab) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    facet_wrap(as.formula(paste("~", ancestry_col)), scales = "free_x")
+
+  # Add p-values as text annotations for each facet (only for non-NA values)
+  p_values_df_valid <- p_values_df[p_values_df$p_value != "NA", ]
+  if (nrow(p_values_df_valid) > 0) {
+    p <- p +
+      geom_text(data = p_values_df_valid,
+                aes(x = Inf, y = Inf, label = paste("p =", p_value)),
+                inherit.aes = FALSE,
+                vjust = 2, hjust = 1.1, size = 3)
+  }
+
+  # Apply logarithmic scale if log_scale is TRUE
+  if (log_scale) {
+    p <- p + scale_y_continuous(
+      trans = scales::log1p_trans(),
+      breaks = if (!is.null(breaks)) breaks else waiver()
+    )
+  }
+
+  return(p)
 }
 
 calc_location_wilcox <- function(sv_df, filter_var="SV.type", filter_element, group, location, gene){
@@ -2402,41 +3716,110 @@ calc_location_wilcox <- function(sv_df, filter_var="SV.type", filter_element, gr
     group_by(!!sym(group), sample) %>%
     summarise(count = n(), .groups = 'drop')
   
-  # Check if there are at least two samples 
+  # Check if there are at least two samples
   if (nrow(data) == 1) {
     #print(paste("Only one sample for gene:", gene, "and location:", location))
     return(NA)  # Return NA if not enough groups
   }
-  
-  # Check if there are at least two groups
-  if (length(unique(data[[group]])) < 2) {
+
+  # Check if there are at least two groups with actual values (not NA)
+  non_na_groups <- unique(data[[group]][!is.na(data[[group]])])
+  if (length(non_na_groups) < 2) {
     print(paste("Not enough groups for gene:", gene, "and location:", location, "num samples:", nrow(data)))
     print(data[[group]])
     return(NA)  # Return NA if not enough groups
   }
-  
+
   # Only return p-value from Wilcox test
   return(wilcox.test(reformulate(group, "count"), data = data, exact=FALSE)$p.value)
 }
 
 count_location_wilcox <- function(te_df, gene_vector, filter_var="SV.type", filter_element, group, location) {
   # Initialize a dataframe to store the results
-  results <- data.frame(gene = character(), p_value = numeric(), stringsAsFactors = FALSE)
-  
+  results <- data.frame(gene = character(), p_value = numeric(),
+                       mutant_affected = integer(), mutant_unaffected = integer(),
+                       wt_affected = integer(), wt_unaffected = integer(),
+                       stringsAsFactors = FALSE)
+
+  # Get unique samples per group
+  all_samples_per_group <- te_df %>%
+    distinct(sample, !!sym(group)) %>%
+    group_by(!!sym(group)) %>%
+    summarise(all_samples = list(sample), .groups = "drop")
+
   # Loop through each gene
   for (i in 1:length(gene_vector)) {
     p_value <- calc_location_wilcox(te_df, filter_element=filter_element, group=group, location=location, gene=gene_vector[i])
-    
+
     if (is.na(p_value)) {
       next  # Skip this iteration if the combination is not present
     }
-    
-    results <- rbind(results, data.frame(gene = gene_vector[i], p_value = p_value))
+
+    # Get samples affected by this gene
+    gene_df <- te_df %>% filter(Gene_name == gene_vector[i])
+
+    # Apply location filter if specified
+    if (is.character(location) && !any(is.na(location))) {
+      if (length(location) == 1) {
+        gene_df <- gene_df %>% filter(Location2 == location)
+      } else if (length(location) == 2) {
+        gene_df <- gene_df %>% filter(Location2 == location[1] | Location2 == location[2])
+      }
+    }
+
+    # Apply filter_element if specified
+    if (!is.na(filter_element)) {
+      gene_df <- gene_df %>% filter(!!sym(filter_var) == filter_element)
+    }
+
+    # Get affected samples per group
+    affected_samples_per_group <- gene_df %>%
+      distinct(sample, !!sym(group)) %>%
+      group_by(!!sym(group)) %>%
+      summarise(affected_samples = list(sample), .groups = "drop")
+
+    # Calculate counts for each group
+    group_levels <- unique(te_df[[group]])
+    mutant_affected <- 0
+    mutant_unaffected <- 0
+    wt_affected <- 0
+    wt_unaffected <- 0
+
+    for (grp in group_levels) {
+      all_samples <- all_samples_per_group %>% filter(!!sym(group) == grp) %>% pull(all_samples) %>% unlist()
+      affected_samples <- affected_samples_per_group %>% filter(!!sym(group) == grp) %>% pull(affected_samples)
+
+      if (length(affected_samples) > 0) {
+        affected_samples <- unlist(affected_samples)
+      } else {
+        affected_samples <- character(0)
+      }
+
+      n_affected <- length(affected_samples)
+      n_unaffected <- length(all_samples) - n_affected
+
+      if (grepl("Mutant", grp, ignore.case = TRUE)) {
+        mutant_affected <- n_affected
+        mutant_unaffected <- n_unaffected
+      } else {
+        wt_affected <- n_affected
+        wt_unaffected <- n_unaffected
+      }
+    }
+
+    results <- rbind(results, data.frame(
+      gene = gene_vector[i],
+      mutant_affected = mutant_affected,
+      mutant_unaffected = mutant_unaffected,
+      wt_affected = wt_affected,
+      wt_unaffected = wt_unaffected,
+      p_value = p_value
+    ))
   }
-  
+
   # Correct p-values for multiple testing
   results$fdr <- p.adjust(results$p_value, method = "fdr")
-  
+
   # Return the results dataframe
   return(results)
 }
@@ -2557,7 +3940,7 @@ plot_box_perchr <- function(df, group, y_lab){
 }
 
 # plot number of TE per chromsomes
-plot_count_perchr <- function(df, type = NA, group, y_lab) {
+plot_count_perchr <- function(df, type = NA, group, y_lab, chr_length = chr_lengths) {
   # Determine the columns to select based on the presence of type
   if (!is.na(type)) {
     columns_to_select <- grep(paste0("_", type, "$"), colnames(df), value = TRUE)
@@ -2576,8 +3959,34 @@ plot_count_perchr <- function(df, type = NA, group, y_lab) {
     pivot_longer(cols = starts_with("chr"), names_to = "chr", values_to = "count") %>%
     mutate(chr = str_remove(chr, "^chr")) %>%
     mutate(chr = str_remove(chr, "_.*$"))
-  
+
   # Normalize the counts
+  data <- as.data.frame(data)
+  
+  # Convert chr_length to data.frame if it's a named vector
+  if (is.vector(chr_length)) {
+    chr_length <- data.frame(
+      chr = names(chr_length),
+      length = as.numeric(chr_length),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    chr_length <- as.data.frame(chr_length)
+    if (!"length" %in% colnames(chr_length)) {
+      # Try to find the length column by other names
+      length_col <- grep("length|Length|LENGTH", colnames(chr_length), value = TRUE)[1]
+      if (!is.na(length_col)) {
+        chr_length$length <- chr_length[[length_col]]
+      } else {
+        stop("Cannot find length column in chr_length")
+      }
+    }
+    chr_length$length <- as.numeric(chr_length$length)
+  }
+  
+  data$chr <- as.character(data$chr)
+  chr_length$chr <- as.character(chr_length$chr)
+  
   data <- data %>%
     left_join(chr_length, by = "chr") %>%
     mutate(normalized_count = count / length)
@@ -2623,7 +4032,10 @@ plot_count_perchr <- function(df, type = NA, group, y_lab) {
     # Calculate the x-position for the annotation based on the chromosome
     x_pos <- which(levels(data$chr) == ann$chromosome)
     
-    plot_data <- plot_data + annotate("text", x = x_pos, y = y_pos, label = p_label, size = 16/.pt, vjust = -0.5)
+    # Only add annotation if chromosome is found in the levels and has significant p-value
+    if (length(x_pos) > 0 && length(y_pos) > 0 && !is.na(y_pos) && !is.na(p_label) && p_label != "") {
+      plot_data <- plot_data + annotate("text", x = x_pos, y = y_pos, label = p_label, size = 16/.pt, vjust = -0.5)
+    }
   }
   
   return(plot_data)
@@ -2638,52 +4050,80 @@ plot_box_perchr_notest <- function(df, chrom, count_y, y_lab){
 }
 
 # plot number of TE per chromsomes
-plot_count_perchr_notest <- function(df, type=NA, y_lab, log_scale=FALSE) {
+plot_count_perchr_notest <- function(df, chr_length = chr_lengths, type = NA, y_lab, log_scale = FALSE) {
   # Determine the columns to select based on the presence of filter_element
   if (!is.na(type)) {
     columns_to_select <- grep(paste0("_", type, "$"), colnames(df), value = TRUE)
   } else {
     columns_to_select <- grep("^chr[0-9XY]+$", colnames(df), value = TRUE)
   }
-  
+
   if (length(columns_to_select) == 0) {
     stop("Specified combination columns not found in the data frame.")
   }
-  
+
   # Select the relevant columns and pivot to long format
   data <- df %>%
     select(sample, all_of(columns_to_select)) %>%
     pivot_longer(-sample, names_to = "chr", values_to = "count") %>%
-    mutate(chr = str_remove(chr, "^chr")) %>%
-    mutate(chr = str_remove(chr, "_.*$"))
-  
+    mutate(
+      chr = str_remove(chr, "^chr"),
+      chr = str_remove(chr, "_.*$")
+    )
+
   # Normalize the counts
+  # Convert chr_length to data.frame if it's a named vector
+  if (is.vector(chr_length)) {
+    chr_length <- data.frame(
+      chr = names(chr_length),
+      length = as.numeric(chr_length),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    chr_length <- as.data.frame(chr_length)
+    if (!"length" %in% colnames(chr_length)) {
+      # Try to find the length column by other names
+      length_col <- grep("length|Length|LENGTH", colnames(chr_length), value = TRUE)[1]
+      if (!is.na(length_col)) {
+        chr_length$length <- chr_length[[length_col]]
+      } else {
+        stop("Cannot find length column in chr_length")
+      }
+    }
+    chr_length$length <- as.numeric(chr_length$length)
+  }
+  
+  data$chr <- as.character(data$chr)
+  chr_length$chr <- as.character(chr_length$chr)
+  data$count <- as.numeric(data$count)
+  
   data <- data %>%
     left_join(chr_length, by = "chr") %>%
     mutate(normalized_count = count / length)
-  
+
   # Set factor levels for chromosome ordering
   data$chr <- factor(data$chr, levels = chr_length$chr)
-  
-  # Handle log scale by adding epsilon to normalized_count
-  if (log_scale == TRUE) {
-    epsilon <- 1e-6  # Small constant to handle zeros
+
+  # Handle log scale
+  if (log_scale) {
+    epsilon <- 1e-6
     data <- data %>%
-      mutate(normalized_count = normalized_count + epsilon)  # Add epsilon to avoid log(0)
+      mutate(normalized_count = normalized_count + epsilon)
   }
-  
-  # Plot using the custom plot function
+
+  # Plot using the custom function
   plot_data <- plot_box_perchr_notest(data, "chr", "normalized_count", y_lab)
-  
-  # Add log scale to the plot if requested
-  if (log_scale == TRUE) {
+
+  # Add log scale if needed
+  if (log_scale) {
     plot_data <- plot_data +
       scale_y_log10(labels = scales::label_log(base = 10)) +
-      labs(y = paste("Log10(", y_lab, " + ", epsilon, ")"))  # Update Y-axis label
+      labs(y = paste("Log10(", y_lab, " + ", epsilon, ")"))
   }
-  
+
   return(plot_data)
 }
+
 
 # plot box plot per tumor type
 plot_box_tt <- function(df, count_y, group, y_lab, legend_lab=NULL, log_scale=FALSE){
@@ -2823,14 +4263,27 @@ plot_count_kruskal_nogroup <- function(df,  column, min, chr, type, x_lab, y_lab
   df_filtered <- df_filtered %>%
     mutate(!!sym(column) := factor(!!sym(column), levels = medians[[column]]))  # Reorder column
   
-  # Perform Kruskal-Wallis test
-  formula <- reformulate(combination, column)
-  print("dependent ~ independent")
-  print(formula)
-  p_value <- kruskal.test(formula, data = df_filtered)$p.value
+  # Check if there are at least 2 groups for Kruskal-Wallis test
+  unique_groups <- unique(df_filtered[[column]])
+  unique_groups <- unique_groups[!is.na(unique_groups)]
+  
+  if (length(unique_groups) < 2) {
+    cat("Kruskal-Wallis test requires at least 2 groups. Column:", column, "has", length(unique_groups), "unique value(s):", paste(unique_groups, collapse = ", "), ". Skipping statistical test.\n")
+    p_value <- NA
+  } else {
+    # Perform Kruskal-Wallis test
+    formula <- reformulate(column, combination)
+    print("dependent ~ independent")
+    print(formula)
+    p_value <- kruskal.test(formula, data = df_filtered)$p.value
+  }
   
   # Format the p-value for display
-  p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  if (is.na(p_value)) {
+    p_value_formatted <- "NA"
+  } else {
+    p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  }
   
   # Plot
   p <- ggplot(df_filtered, aes_string(x = column, y = combination, fill = column)) +
@@ -3863,66 +5316,67 @@ plot_pie_chart <- function(data, column_name, ylab) {
   # Calculate frequencies
   data_to_plot <- as.data.frame(table(data[[column_name]]))
   names(data_to_plot) <- c("Category", "Freq")
-  
+
   # Calculate total
   total <- sum(data_to_plot$Freq)
-  
+
   # Determine threshold for grouping into 'Other'
   threshold <- 0.02 * total
-  
+
   # Group small categories into 'Other'
   data_to_plot$Category <- ifelse(data_to_plot$Freq < threshold, 'Other', as.character(data_to_plot$Category))
-  
+
   # Aggregate frequencies by category
   data_to_plot <- aggregate(Freq ~ Category, data_to_plot, sum)
-  
+
   if (column_name == "TP53_status") {
-    data_to_plot$Category<- factor(data_to_plot$Category, levels = c("WT", "Mutant"))
+    data_to_plot$Category <- factor(data_to_plot$Category, levels = c("WT", "Mutant"))
   }
-  
+
   if (column_name == "sex") {
     category_mapping <- c("F" = "Female", "M" = "Male")
-    
     # Map abbreviations to full names
     data_to_plot$Category <- category_mapping[as.character(data_to_plot$Category)]
-    
     # Factorize with desired levels
     data_to_plot$Category <- factor(data_to_plot$Category, levels = c("Female", "Male"))
   }
-  
+
   if (column_name == "tumor_type") {
-    data_to_plot <- data_to_plot %>% filter(Category!="U") # remove no cancer
+    data_to_plot <- data_to_plot %>% dplyr::filter(Category != "U") # remove no cancer
   }
-    
+
   # Calculate percentage for labels
   data_to_plot$Percentage <- round((data_to_plot$Freq / total) * 100, 1)
   data_to_plot$Label <- paste0(data_to_plot$Category, ": ", data_to_plot$Percentage, "%")
-  
+
+  # Dynamically generate a color palette for the number of categories
+  n_cats <- nrow(data_to_plot)
+  # Use multiple qualitative palettes for more variety
+  palette_list <- c("Set3", "Paired", "Dark2", "Pastel1", "Pastel2", "Set1", "Set2", "Accent")
+  all_colours <- unlist(lapply(palette_list, function(pal) RColorBrewer::brewer.pal(RColorBrewer::brewer.pal.info[pal,]$maxcolors, pal)))
+  # Remove duplicates and ensure enough colors
+  all_colours <- unique(all_colours)
+  if (n_cats > length(all_colours)) {
+    pie_colours <- colorRampPalette(all_colours)(n_cats)
+  } else {
+    pie_colours <- all_colours[1:n_cats]
+  }
+
   # Plot
   p <- ggplot(data_to_plot, aes(x = "", y = Freq, fill = Category)) +
     geom_bar(width = 1, stat = "identity") +
-    coord_polar("y", start = 0) + 
+    coord_polar("y", start = 0) +
     theme_void() +
     theme(legend.position = "right")
-  
-  # Define color scheme based on column_name
-  if (column_name == "TP53_status") {
-    p <- p +scale_fill_manual(values = colours, name = ylab, labels = data_to_plot$Label)
-  } else if (column_name == "tumor_type") {
-    default_colors <- scales::hue_pal()(nrow(data_to_plot) - 1) # Generate default colors
-    color_mapping <- setNames(c(default_colors, "grey"), 
-                              c(data_to_plot$Category[data_to_plot$Category != "Other"], "Other"))
-    p <- p + scale_fill_manual(values = color_mapping, name = ylab, labels = data_to_plot$Label)
-  } else if (column_name == "sex") {
-    p <- p + scale_fill_manual(values = colours_sex, name = ylab, labels = data_to_plot$Label)
-  } else if (column_name == "new_cohort") {
-    p <- p + scale_fill_manual(values = colour_palette_4, name=ylab)
-  }
-  
+
+  # Always use the dynamically generated palette
+  color_mapping <- setNames(pie_colours, data_to_plot$Category)
+  p <- p + scale_fill_manual(values = color_mapping, name = ylab, labels = data_to_plot$Label)
+
   # Adjust legend title and text size
-  p <- p + theme(legend.title = element_text(size = 18), 
-                 legend.text = element_text(size = 16)) 
-  
+  p <- p + theme(legend.title = element_text(size = 18),
+                 legend.text = element_text(size = 16))
+
   return(p)
 }
 
@@ -4022,6 +5476,264 @@ identify_sv_in_te_onebreak <- function(df_sv, df_te) {
   return(results)
 }
 
+identify_sv_in_te_linx <- function(df_sv, df_te) {
+  setDT(df_sv)
+  setDT(df_te)
+
+  # Rename columns in df_te for clarity
+  setnames(df_te, old = c("SV_start", "SV_chrom", "SV_length", "ALT"), new = c("TE.start", "TE.chrom", "TE.length", "TE.type"))
+  setnames(df_sv, old = c("SampleId", "PosStart", "PosEnd", "ChrStart", "Type"), new = c("sample", "SV.start", "SV.end", "SV.chrom", "SV.type"))
+
+  # end of TE is start plus length
+  df_te$TE.end = df_te$TE.start + df_te$TE.length
+
+  results_list <- list()
+  samples_sv <- unique(df_sv$sample)
+
+  # Get TE samples that have at least one TE (count > 0)
+  # df_te has been filtered so each row is a TE insertion, meaning all samples here have count > 0
+  samples_te_with_count <- unique(df_te$sample)
+  samples_te_base <- sub("_T$", "", samples_te_with_count)  # Remove _T suffix
+
+  # Find overlap - also check with underscore to hyphen conversion
+  samples_with_both <- intersect(samples_sv, samples_te_base)
+
+  # Also check if SV samples with _ converted to - match TE samples
+  samples_sv_alt <- gsub("_", "-", samples_sv)
+  samples_with_both_alt <- intersect(samples_sv_alt, samples_te_base)
+
+  # Combine matches
+  all_matched_te_samples <- unique(c(samples_te_base[samples_te_base %in% samples_sv],
+                                      samples_te_base[samples_te_base %in% samples_sv_alt]))
+  samples_te_no_sv <- setdiff(samples_te_base, all_matched_te_samples)
+
+  # Hardcoded sample mappings (SV sample -> TE sample)
+  hardcoded_mappings <- c(
+    "U02H2D_5524A" = "U02H2D_A_T",
+    "5009_4856_1" = "5009_1_T",
+    "5471_5787_2" = "5471_2_T",
+    "621_3311A_1" = "621_1_T",
+    "PD13489_PD13489a" = "PD13489_T"
+  )
+
+  for (sample_id in samples_sv) {
+    sv_sample <- df_sv[sample == sample_id]
+
+    # Strategy 0: Check hardcoded mappings first
+    if (sample_id %in% names(hardcoded_mappings)) {
+      te_sample_id <- hardcoded_mappings[[sample_id]]
+      te_sample <- df_te[sample == te_sample_id]
+      if (nrow(te_sample) > 0) {
+        cat("  Note: Matched SV sample", sample_id, "to TE sample", te_sample_id, "(hardcoded mapping)\n")
+      }
+    } else {
+      # Strategy 1: Try exact match with _T suffix
+      te_sample_id <- paste0(sample_id, "_T")
+      te_sample <- df_te[sample == te_sample_id]
+    }
+
+    # Strategy 2: Try converting SV all underscores to hyphens (e.g., 0218_18_751 -> 0218-18-751_T)
+    if (nrow(te_sample) == 0) {
+      te_sample_id_alt <- paste0(gsub("_", "-", sample_id), "_T")
+      te_sample <- df_te[sample == te_sample_id_alt]
+      if (nrow(te_sample) > 0) {
+        cat("  Note: Matched SV sample", sample_id, "to TE sample", te_sample_id_alt, "(SV _ to -)\n")
+      }
+    }
+
+    # Strategy 3: Try keeping first underscore, convert rest to hyphens (e.g., 0296_19_6855 -> 0296_19-6855_T)
+    if (nrow(te_sample) == 0) {
+      # Split on first underscore, then convert remaining underscores to hyphens
+      parts <- strsplit(sample_id, "_", fixed = TRUE)[[1]]
+      if (length(parts) > 2) {
+        te_sample_id_alt3 <- paste0(parts[1], "_", paste(parts[-1], collapse = "-"), "_T")
+        te_sample <- df_te[sample == te_sample_id_alt3]
+        if (nrow(te_sample) > 0) {
+          cat("  Note: Matched SV sample", sample_id, "to TE sample", te_sample_id_alt3, "(SV keep first _, rest to -)\n")
+        }
+      }
+    }
+
+    # Strategy 4: Try matching with flexible -/_ replacement
+    if (nrow(te_sample) == 0) {
+      # Create pattern by replacing each _ or - with a regex that matches either
+      sample_pattern <- gsub("[-_]", "[-_]", sample_id)
+      matching_samples <- grep(paste0("^", sample_pattern, "_T$"), df_te$sample, value = TRUE)
+      if (length(matching_samples) > 0) {
+        te_sample <- df_te[sample == matching_samples[1]]
+        if (nrow(te_sample) > 0) {
+          cat("  Note: Matched SV sample", sample_id, "to TE sample", matching_samples[1], "(flexible -/_)\n")
+        }
+      }
+    }
+
+    # Skip if still no TE data for this sample
+    if (nrow(te_sample) == 0) {
+      next
+    }
+
+    # Find SVs with start positions within TEs
+    start_matches <- sv_sample[te_sample, on = .(SV.chrom = TE.chrom), nomatch = 0, allow.cartesian = TRUE]
+    start_matches <- start_matches[TE.start <= SV.start & TE.end >= SV.start, 
+                                   .(sample, SV.chrom, SV.start, SV.end, SV.type, TE.start, TE.end, TE.type)]
+    
+    # Find SVs with end positions within TEs
+    end_matches <- sv_sample[te_sample, on = .(SV.chrom = TE.chrom), nomatch = 0, allow.cartesian = TRUE]
+    end_matches <- end_matches[TE.start <= SV.end & TE.end >= SV.end, 
+                               .(sample, SV.chrom, SV.start, SV.end, SV.type, TE.start, TE.end, TE.type)]
+    
+    # Merge start and end matches on common columns
+    combined_matches <- merge(start_matches, end_matches, 
+                              by = c("sample", "SV.chrom", "SV.start", "SV.end", "SV.type", "TE.type"),
+                              suffixes = c(".one", ".two"), allow.cartesian = TRUE)
+    
+    # Filter for different TE instances with the same TE type
+    final_matches <- combined_matches[TE.start.one!= TE.start.two & TE.end.one != TE.end.two, ]
+    
+    if (nrow(final_matches) > 0) {
+      results_list[[sample_id]] <- final_matches
+    }
+  }
+  
+  # Combine all results into a single data.table
+  results <- rbindlist(results_list, use.names = TRUE, fill = TRUE)
+
+  cat("  Number of samples with SV data:", length(samples_sv), "\n")
+  cat("  Number of samples with TE count > 0:", length(samples_te_base), "\n")
+  cat("  Number of samples with both SV and TE data:", length(samples_with_both), "\n")
+  cat("  Number of samples with TE count > 0 but no SV data:", length(samples_te_no_sv), "\n")
+  cat("  SVs found with both breakpoints in TEs:", nrow(results), "\n")
+
+  # Return both results and sample lists
+  attr(results, "samples_te_no_sv") <- samples_te_no_sv
+  return(results)
+}
+
+identify_sv_in_te_linx_onebreak <- function(df_sv, df_te) {
+  setDT(df_sv)
+  setDT(df_te)
+
+  # Rename columns in df_te for clarity
+  setnames(df_te, old = c("SV_start", "SV_chrom", "SV_length", "ALT"), new = c("TE.start", "TE.chrom", "TE.length", "TE.type"))
+  setnames(df_sv, old = c("SampleId", "PosStart", "PosEnd", "ChrStart", "Type"), new = c("sample", "SV.start", "SV.end", "SV.chrom", "SV.type"))
+
+  # end of TE is start plus length
+  df_te$TE.end = df_te$TE.start + df_te$TE.length
+
+  results_list <- list()
+  samples_sv <- unique(df_sv$sample)
+
+  # Get TE samples that have at least one TE (count > 0)
+  # df_te has been filtered so each row is a TE insertion, meaning all samples here have count > 0
+  samples_te_with_count <- unique(df_te$sample)
+  samples_te_base <- sub("_T$", "", samples_te_with_count)  # Remove _T suffix
+
+  # Find overlap - also check with underscore to hyphen conversion
+  samples_with_both <- intersect(samples_sv, samples_te_base)
+
+  # Also check if SV samples with _ converted to - match TE samples
+  samples_sv_alt <- gsub("_", "-", samples_sv)
+  samples_with_both_alt <- intersect(samples_sv_alt, samples_te_base)
+
+  # Combine matches
+  all_matched_te_samples <- unique(c(samples_te_base[samples_te_base %in% samples_sv],
+                                      samples_te_base[samples_te_base %in% samples_sv_alt]))
+  samples_te_no_sv <- setdiff(samples_te_base, all_matched_te_samples)
+
+  # Hardcoded sample mappings (SV sample -> TE sample)
+  hardcoded_mappings <- c(
+    "U02H2D_5524A" = "U02H2D_A_T",
+    "5009_4856_1" = "5009_1_T",
+    "5471_5787_2" = "5471_2_T",
+    "621_3311A_1" = "621_1_T",
+    "PD13489_PD13489a" = "PD13489_T"
+  )
+
+  for (sample_id in samples_sv) {
+    sv_sample <- df_sv[sample == sample_id]
+
+    # Strategy 0: Check hardcoded mappings first
+    if (sample_id %in% names(hardcoded_mappings)) {
+      te_sample_id <- hardcoded_mappings[[sample_id]]
+      te_sample <- df_te[sample == te_sample_id]
+      if (nrow(te_sample) > 0) {
+        cat("  Note: Matched SV sample", sample_id, "to TE sample", te_sample_id, "(hardcoded mapping)\n")
+      }
+    } else {
+      # Strategy 1: Try exact match with _T suffix
+      te_sample_id <- paste0(sample_id, "_T")
+      te_sample <- df_te[sample == te_sample_id]
+    }
+
+    # Strategy 2: Try converting SV all underscores to hyphens (e.g., 0218_18_751 -> 0218-18-751_T)
+    if (nrow(te_sample) == 0) {
+      te_sample_id_alt <- paste0(gsub("_", "-", sample_id), "_T")
+      te_sample <- df_te[sample == te_sample_id_alt]
+      if (nrow(te_sample) > 0) {
+        cat("  Note: Matched SV sample", sample_id, "to TE sample", te_sample_id_alt, "(SV _ to -)\n")
+      }
+    }
+
+    # Strategy 3: Try keeping first underscore, convert rest to hyphens (e.g., 0296_19_6855 -> 0296_19-6855_T)
+    if (nrow(te_sample) == 0) {
+      # Split on first underscore, then convert remaining underscores to hyphens
+      parts <- strsplit(sample_id, "_", fixed = TRUE)[[1]]
+      if (length(parts) > 2) {
+        te_sample_id_alt3 <- paste0(parts[1], "_", paste(parts[-1], collapse = "-"), "_T")
+        te_sample <- df_te[sample == te_sample_id_alt3]
+        if (nrow(te_sample) > 0) {
+          cat("  Note: Matched SV sample", sample_id, "to TE sample", te_sample_id_alt3, "(SV keep first _, rest to -)\n")
+        }
+      }
+    }
+
+    # Strategy 4: Try matching with flexible -/_ replacement
+    if (nrow(te_sample) == 0) {
+      # Create pattern by replacing each _ or - with a regex that matches either
+      sample_pattern <- gsub("[-_]", "[-_]", sample_id)
+      matching_samples <- grep(paste0("^", sample_pattern, "_T$"), df_te$sample, value = TRUE)
+      if (length(matching_samples) > 0) {
+        te_sample <- df_te[sample == matching_samples[1]]
+        if (nrow(te_sample) > 0) {
+          cat("  Note: Matched SV sample", sample_id, "to TE sample", matching_samples[1], "(flexible -/_)\n")
+        }
+      }
+    }
+
+    # Skip if still no TE data for this sample
+    if (nrow(te_sample) == 0) {
+      next
+    }
+
+    # Find SVs with start positions within TEs
+    start_matches <- sv_sample[te_sample, on = .(SV.chrom = TE.chrom), nomatch = 0, allow.cartesian = TRUE]
+    start_matches <- start_matches[TE.start <= SV.start & TE.end >= SV.start,
+                                   .(sample, SV.chrom, SV.start, SV.end, SV.type, TE.start, TE.end, TE.type)]
+
+    # Find SVs with end positions within TEs
+    end_matches <- sv_sample[te_sample, on = .(SV.chrom = TE.chrom), nomatch = 0, allow.cartesian = TRUE]
+    end_matches <- end_matches[TE.start <= SV.end & TE.end >= SV.end,
+                               .(sample, SV.chrom, SV.start, SV.end, SV.type, TE.start, TE.end, TE.type)]
+
+    # Combine start and end matches for the current sample, removing duplicates
+    combined_matches <- unique(rbindlist(list(start_matches, end_matches), use.names = TRUE, fill = TRUE))
+
+    if (nrow(combined_matches) > 0) {
+      results_list[[sample_id]] <- combined_matches
+    }
+  }
+
+  # Combine all results from all samples into a single data.table
+  results <- rbindlist(results_list, use.names = TRUE, fill = TRUE)
+
+  cat("  Number of samples with SV data:", length(samples_sv), "\n")
+  cat("  Number of samples with TE count > 0:", length(samples_te_base), "\n")
+  cat("  Number of samples with both SV and TE data:", length(samples_with_both), "\n")
+  cat("  Number of samples with TE count > 0 but no SV data:", length(samples_te_no_sv), "\n")
+  cat("  SVs found with at least one breakpoint in TE:", nrow(results), "\n")
+  return(results)
+}
+  
 extract_location <- function(df, mutation_column) {
   df %>%
     mutate(location = ifelse(str_detect(.data[[mutation_column]], "\\s"),
@@ -4227,7 +5939,7 @@ plot_top_genes <- function(df, column, label_column=NULL, top_n = 10, x_lab) {
 plot_top_cancer_genes_germline <- function(df, top_n = 10) {
   # Create a frequency table for the "Gene_name" column
   gene_freq <- as.data.frame(table(df$Gene_name))
-  
+  print(head(gene_freq, n = 10))  # Print the first 10 rows of the frequency table for debugging
   # Rename the columns for clarity
   colnames(gene_freq) <- c("Gene", "Frequency")
   
@@ -4823,22 +6535,26 @@ replace_gene_names <- function(df) {
 }
 
 add_gene_size_todf <- function(df_te, df_size) {
+  # Ensure gene_size has unique entries per gene (take first occurrence if duplicates)
+  df_size_unique <- df_size %>%
+    distinct(name2, .keep_all = TRUE)
+
   # Merge te_aff_split with gene_size where Gene_name matches name2
   merged_df <- df_te %>%
-    left_join(df_size, by = c("Gene_name" = "name2"))
-  
+    left_join(df_size_unique, by = c("Gene_name" = "name2"))
+
   # Filter rows where gene_size is NA
   no_size_rows <- merged_df %>%
     filter(is.na(gene_size))
-  
+
   # Count and list gene names with no size
   count_no_size <- nrow(no_size_rows)
   gene_names_no_size <- unique(no_size_rows$Gene_name)
-  
+
   # Print information
   cat("Number of genes with no size information:", count_no_size, "\n")
   cat("Gene names with no size information:\n", paste(gene_names_no_size, collapse = ", "), "\n")
-  
+
   # Return the merged dataframe
   return(merged_df)
 }
@@ -4859,6 +6575,230 @@ perform_ora <- function(df, nsample_thresh = 0, filter_exon = FALSE) {
   )
   
   # Return ORA results
+  return(ora)
+}
+
+# Run pathway analysis with multiple parameter combinations and organize results
+run_pathway_parameter_sweep <- function(data_list, param_grid, output_base_dir,
+                                       output_subdir = NULL,
+                                       csv_dir = NULL,
+                                       analysis_name = "pathway_sweep",
+                                       create_plots = TRUE,
+                                       plot_formats = c("png", "pdf")) {
+  # data_list: named list of input data (e.g., list(tp53_specific = df1, cancer_specific = df2))
+  # param_grid: data frame with columns for each parameter to vary
+  # output_base_dir: base directory for plots
+  # output_subdir: subdirectory within output_base_dir for plots (e.g., "pathway")
+  # csv_dir: directory for CSV files (if NULL, uses output_base_dir)
+
+  cat("\n========================================\n")
+  cat("PATHWAY PARAMETER SWEEP\n")
+  cat("========================================\n")
+  cat("Analysis:", analysis_name, "\n")
+  cat("Parameter combinations:", nrow(param_grid), "\n")
+  cat("Data sources:", length(data_list), "\n")
+  cat("Plot directory:", output_base_dir, "\n")
+  if (!is.null(csv_dir)) cat("CSV directory:", csv_dir, "\n")
+  cat("\n")
+
+  # Set up plot directory
+  if (!is.null(output_subdir)) {
+    plot_dir <- file.path(output_base_dir, output_subdir)
+  } else {
+    plot_dir <- output_base_dir
+  }
+  dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Set up CSV directory
+  if (is.null(csv_dir)) {
+    csv_dir <- plot_dir
+  }
+  dir.create(csv_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Initialize results tracking
+  all_results <- list()
+  summary_table <- data.frame()
+
+  # Loop through each parameter combination
+  for (i in 1:nrow(param_grid)) {
+    params <- param_grid[i, ]
+
+    # Create parameter suffix for file naming with new naming convention
+    param_names <- names(params)
+    param_values <- as.character(params)
+    param_suffix <- paste(
+      ifelse(param_names == "min_samples", paste0("min", param_values),
+      ifelse(param_names == "p_gene", paste0("pgene", param_values),
+      ifelse(param_names == "p_pathway", paste0("ppathway", param_values),
+      ifelse(param_names == "q_pathway", paste0("qpathway", param_values),
+      paste0(param_names, param_values))))),
+      collapse = "_"
+    )
+
+    cat("\n--- Parameter set", i, "of", nrow(param_grid), "---\n")
+    print(params)
+
+    # Loop through each data source
+    for (data_name in names(data_list)) {
+      # Extract dataset name (e.g., "tp53" from "tp53_min5")
+      dataset_name <- sub("_min.*", "", data_name)
+
+      # Create run_id in format: pathway_dataset_paramvalues
+      run_id <- paste0(analysis_name, "_", dataset_name, "_", param_suffix)
+      cat("\nProcessing:", run_id, "\n")
+
+      tryCatch({
+        # Get data and apply filters based on parameters
+        data <- data_list[[data_name]]
+
+        # Apply min_samples filter if parameter exists
+        if ("min_samples" %in% names(params)) {
+          # Assume data has 'sample' column to count
+          if ("sample" %in% colnames(data)) {
+            gene_sample_counts <- data %>%
+              group_by(Gene_name) %>%
+              summarise(n_samples = n_distinct(sample), .groups = "drop") %>%
+              filter(n_samples >= params$min_samples)
+
+            data <- data %>% filter(Gene_name %in% gene_sample_counts$Gene_name)
+            cat("  Genes passing min_samples filter:", length(unique(data$Gene_name)), "\n")
+          }
+        }
+
+        # Apply p_gene filter if parameter exists and p_value/fdr column present
+        if ("p_gene" %in% names(params)) {
+          if ("fdr" %in% colnames(data)) {
+            data <- data %>% filter(fdr < params$p_gene)
+            cat("  Genes passing p_gene (fdr) filter:", length(unique(data$Gene_name)), "\n")
+          } else if ("p_value" %in% colnames(data)) {
+            data <- data %>% filter(p_value < params$p_gene)
+            cat("  Genes passing p_gene (p_value) filter:", length(unique(data$Gene_name)), "\n")
+          }
+        }
+
+        if (nrow(data) == 0) {
+          cat("  WARNING: No data remaining after filters. Skipping.\n")
+          next
+        }
+
+        # Perform ORA with custom cutoffs if provided
+        p_pathway <- ifelse("p_pathway" %in% names(params), params$p_pathway, 0.05)
+        q_pathway <- ifelse("q_pathway" %in% names(params), params$q_pathway, 0.1)
+
+        ora_result <- perform_ora_custom_cutoffs(data,
+                                                 p_pathway = p_pathway,
+                                                 q_pathway = q_pathway)
+
+        # Save results
+        if (!is.null(ora_result) && nrow(as.data.frame(ora_result)) > 0) {
+          # Save full ORA table to CSV directory
+          write.csv(as.data.frame(ora_result),
+                   file.path(csv_dir, paste0(run_id, ".csv")),
+                   row.names = FALSE)
+
+          # Save gene list to CSV directory
+          write.table(unique(data$Gene_name),
+                     file.path(csv_dir, paste0(run_id, "_genes.txt")),
+                     row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+          # Record summary metrics
+          summary_row <- data.frame(
+            run_id = run_id,
+            data_source = data_name,
+            params,
+            n_genes_input = length(unique(data$Gene_name)),
+            n_pathways_enriched = nrow(as.data.frame(ora_result)),
+            top_pathway = as.data.frame(ora_result)$Description[1],
+            top_pathway_pval = as.data.frame(ora_result)$pvalue[1],
+            stringsAsFactors = FALSE
+          )
+          summary_table <- rbind(summary_table, summary_row)
+
+          # Create plots if requested
+          if (create_plots && nrow(as.data.frame(ora_result)) > 0) {
+            for (fmt in plot_formats) {
+              # Dotplot - format: pathway_dataset_graphtype_params
+              p_dot <- dotplot(ora_result, showCategory = 20) +
+                ggtitle(paste0(run_id, "\n", nrow(as.data.frame(ora_result)), " enriched pathways"))
+              ggsave(file.path(plot_dir, paste0(analysis_name, "_", dataset_name, "_dot_", param_suffix, ".", fmt)),
+                     plot = p_dot, width = 10, height = 8)
+
+              # Enrichment map (if enough pathways)
+              if (nrow(as.data.frame(ora_result)) >= 5) {
+                ora_pairwise <- pairwise_termsim(ora_result)
+                p_emap <- emapplot(ora_pairwise, showCategory = 20, pie = "count")
+                ggsave(file.path(plot_dir, paste0(analysis_name, "_", dataset_name, "_emap_", param_suffix, ".", fmt)),
+                       plot = p_emap, width = 12, height = 10)
+              }
+            }
+          }
+
+          all_results[[run_id]] <- ora_result
+          cat("  SUCCESS:", nrow(as.data.frame(ora_result)), "pathways enriched\n")
+        } else {
+          cat("  No significant enrichment found\n")
+          summary_row <- data.frame(
+            run_id = run_id,
+            data_source = data_name,
+            params,
+            n_genes_input = length(unique(data$Gene_name)),
+            n_pathways_enriched = 0,
+            top_pathway = NA,
+            top_pathway_pval = NA,
+            stringsAsFactors = FALSE
+          )
+          summary_table <- rbind(summary_table, summary_row)
+        }
+
+      }, error = function(e) {
+        cat("  ERROR:", e$message, "\n")
+      })
+    }
+  }
+
+  # Save master summary table to CSV directory
+  summary_file <- file.path(csv_dir, paste0(analysis_name, "_summary.csv"))
+  write.csv(summary_table, summary_file, row.names = FALSE)
+
+  cat("\n========================================\n")
+  cat("PARAMETER SWEEP COMPLETE\n")
+  cat("========================================\n")
+  cat("Total runs:", nrow(summary_table), "\n")
+  cat("Successful runs:", sum(summary_table$n_pathways_enriched > 0, na.rm = TRUE), "\n")
+  cat("Plots saved to:", plot_dir, "\n")
+  cat("CSV files saved to:", csv_dir, "\n")
+  cat("Summary table:", summary_file, "\n\n")
+
+  return(list(
+    summary = summary_table,
+    results = all_results,
+    plot_dir = plot_dir,
+    csv_dir = csv_dir
+  ))
+}
+
+# Perform ORA with custom p-value and q-value cutoffs
+perform_ora_custom_cutoffs <- function(df, p_pathway = 0.05, q_pathway = 0.1,
+                                      nsample_thresh = 0, filter_exon = FALSE, gene_col = "Gene_name") {
+  # Get unique genes for ORA
+  geneList <- unique(df[[gene_col]])
+
+  if (length(geneList) < 3) {
+    cat("Too few genes (n =", length(geneList), ") for pathway analysis\n")
+    return(NULL)
+  }
+
+  # Perform ORA using enrichGO
+  ora <- enrichGO(
+    gene          = geneList,
+    OrgDb         = org.Hs.eg.db,
+    keyType       = "SYMBOL",
+    ont           = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = p_pathway,
+    qvalueCutoff  = q_pathway
+  )
+
   return(ora)
 }
 
@@ -4976,17 +6916,62 @@ perform_gsea_tp53 <- function(df, nsample_thresh = 0, filter_exon = FALSE) {
   return(gse_tp53)
 }
 
-perform_ora_tp53 <- function(df) {
+# Perform ORA with custom cutoffs for TP53 status
+perform_ora_tp53_custom_cutoffs <- function(df, p_pathway = 0.05, q_pathway = 0.1, nsample_thresh = 0, gene_col = "Gene_name") {
+  # Filter groups by sample threshold if specified
+  if (nsample_thresh > 0) {
+    # First, identify TP53 status groups that meet the sample threshold
+    samples_per_tp53 <- df %>%
+      group_by(TP53_status) %>%
+      summarise(n_samples = n_distinct(sample.x), .groups = "drop")
+
+    tp53_with_enough_samples <- samples_per_tp53 %>%
+      filter(n_samples >= nsample_thresh) %>%
+      pull(TP53_status)
+
+    cat("TP53 status groups with >=", nsample_thresh, "samples:", paste(tp53_with_enough_samples, collapse=", "), "\n")
+
+    # If fewer than 2 groups meet threshold, return NULL
+    if (length(tp53_with_enough_samples) < 2) {
+      cat("Insufficient TP53 status groups (need at least 2 groups with >=", nsample_thresh, "samples)\n")
+      return(NULL)
+    }
+
+    # Filter to only groups that meet the threshold
+    df <- df %>% filter(TP53_status %in% tp53_with_enough_samples)
+
+    cat("After filtering groups:", length(unique(df[[gene_col]])), "genes across", length(tp53_with_enough_samples), "TP53 groups\n")
+  }
+
   # Over-representation analysis
-  geneClusters_tumour_tp53_ora <- lapply(split(df$Gene_name, df$TP53_status), unique)
-  
+  geneClusters_tumour_tp53_ora <- lapply(split(df[[gene_col]], df$TP53_status), unique)
+
   # Perform ORA with compareCluster
   ora_tp53 <- compareCluster(
     geneCluster = geneClusters_tumour_tp53_ora,
-    fun = "enrichGO",          
+    fun = "enrichGO",
     OrgDb = org.Hs.eg.db,
-    keyType = "SYMBOL",             
-    ont = "BP",                 
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = p_pathway,
+    qvalueCutoff = q_pathway
+  )
+
+  # Return the ORA results
+  return(ora_tp53)
+}
+
+perform_ora_tp53 <- function(df) {
+  # Over-representation analysis
+  geneClusters_tumour_tp53_ora <- lapply(split(df$Gene_name, df$TP53_status), unique)
+
+  # Perform ORA with compareCluster
+  ora_tp53 <- compareCluster(
+    geneCluster = geneClusters_tumour_tp53_ora,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
     pvalueCutoff = 0.05,
     qvalueCutoff = 0.1
   )
@@ -4995,23 +6980,133 @@ perform_ora_tp53 <- function(df) {
   return(ora_tp53)
 }
 
+# Perform ORA with custom cutoffs for cancer cohort
+perform_ora_cancer_custom_cutoffs <- function(df, p_pathway = 0.05, q_pathway = 0.1, nsample_thresh = 0, gene_col = "Gene_name") {
+  # Filter genes by sample threshold if specified
+  if (nsample_thresh > 0) {
+    # First, identify cohorts that meet the sample threshold
+    samples_per_cohort <- df %>%
+      group_by(cohort) %>%
+      summarise(n_samples = n_distinct(sample.x), .groups = "drop")
+
+    cohorts_with_enough_samples <- samples_per_cohort %>%
+      filter(n_samples >= nsample_thresh) %>%
+      pull(cohort)
+
+    cat("Cohorts with >=", nsample_thresh, "samples:", paste(cohorts_with_enough_samples, collapse=", "), "\n")
+
+    # If fewer than 2 cohorts meet threshold, return NULL
+    if (length(cohorts_with_enough_samples) < 2) {
+      cat("Insufficient cohorts (need at least 2 cohorts with >=", nsample_thresh, "samples)\n")
+      return(NULL)
+    }
+
+    # Filter to only cohorts that meet the threshold
+    df <- df %>% filter(cohort %in% cohorts_with_enough_samples)
+
+    cat("After filtering groups:", length(unique(df[[gene_col]])), "genes across", length(cohorts_with_enough_samples), "cohorts\n")
+  }
+
+  # Over-representation analysis
+  geneClusters_ora <- lapply(split(df[[gene_col]], df$cohort), unique)
+
+  # Perform ORA with compareCluster
+  ora_cancer <- compareCluster(
+    geneCluster = geneClusters_ora,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = p_pathway,
+    qvalueCutoff = q_pathway
+  )
+
+  # Return the ORA results
+  return(ora_cancer)
+}
+
 perform_ora_cancer <- function(df) {
   # Over-representation analysis
   geneClusters_ora <- lapply(split(df$Gene_name, df$cohort), unique)
-  
+
   # Perform ORA with compareCluster
   ora_cancer<- compareCluster(
     geneCluster = geneClusters_ora,
-    fun = "enrichGO",          
+    fun = "enrichGO",
     OrgDb = org.Hs.eg.db,
-    keyType = "SYMBOL",             
-    ont = "BP",                 
+    keyType = "SYMBOL",
+    ont = "BP",
     pvalueCutoff = 0.05,
     qvalueCutoff = 0.1
   )
-  
+
   # Return the ORA results
   return(ora_cancer)
+}
+
+# Perform ORA by sample type with custom cutoffs (KICS)
+perform_ora_sample_type_custom_cutoffs <- function(df, p_pathway = 0.05, q_pathway = 0.1, nsample_thresh = 0, sample_type_column = "sample_type", gene_col = "Gene_name") {
+  # Filter genes by sample threshold if specified
+  if (nsample_thresh > 0) {
+    # First, identify sample types that meet the sample threshold
+    samples_per_type <- df %>%
+      group_by(!!sym(sample_type_column)) %>%
+      summarise(n_samples = n_distinct(sample.x), .groups = "drop")
+
+    types_with_enough_samples <- samples_per_type %>%
+      filter(n_samples >= nsample_thresh) %>%
+      pull(!!sym(sample_type_column))
+
+    cat("Sample types with >=", nsample_thresh, "samples:", paste(types_with_enough_samples, collapse=", "), "\n")
+
+    # If fewer than 2 sample types meet threshold, return NULL
+    if (length(types_with_enough_samples) < 2) {
+      cat("Insufficient sample types (need at least 2 types with >=", nsample_thresh, "samples)\n")
+      return(NULL)
+    }
+
+    # Filter to only sample types that meet the threshold
+    df <- df %>% filter(!!sym(sample_type_column) %in% types_with_enough_samples)
+
+    cat("After filtering groups:", length(unique(df[[gene_col]])), "genes across", length(types_with_enough_samples), "sample types\n")
+  }
+
+  # Over-representation analysis by sample type
+  geneClusters_sample_type <- lapply(split(df[[gene_col]], df[[sample_type_column]]), unique)
+
+  # Perform ORA with compareCluster
+  ora_sample_type <- compareCluster(
+    geneCluster = geneClusters_sample_type,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = p_pathway,
+    qvalueCutoff = q_pathway
+  )
+
+  # Return the ORA results
+  return(ora_sample_type)
+}
+
+# Perform ORA by sample type (KICS)
+perform_ora_sample_type <- function(df, sample_type_column = "sample_type") {
+  # Over-representation analysis by sample type
+  geneClusters_sample_type <- lapply(split(df$Gene_name, df[[sample_type_column]]), unique)
+
+  # Perform ORA with compareCluster
+  ora_sample_type <- compareCluster(
+    geneCluster = geneClusters_sample_type,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.1
+  )
+
+  # Return the ORA results
+  return(ora_sample_type)
 }
 
 perform_gsea_tp53_tumour_types <- function(df, tumour_types) {
@@ -5503,10 +7598,20 @@ plot_tp53_variants <- function(df, chr = NA, type = NA, group, x_lab, y_lab, x_o
     df <- df %>% filter(!is.na(!!sym(group)))
   }
   
-  # Perform Kruskal-Wallis test
-  test_result <- kruskal.test(reformulate(group, combination), data = df)
-  p_value <- test_result$p.value
-  p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  # Check if there are at least 2 groups for Kruskal-Wallis test
+  unique_groups <- unique(df[[group]])
+  unique_groups <- unique_groups[!is.na(unique_groups)]
+  
+  if (length(unique_groups) < 2) {
+    cat("Kruskal-Wallis test requires at least 2 groups. Column:", group, "has", length(unique_groups), "unique value(s):", paste(unique_groups, collapse = ", "), ". Skipping statistical test.\n")
+    p_value <- NA
+    p_value_formatted <- "NA"
+  } else {
+    # Perform Kruskal-Wallis test
+    test_result <- kruskal.test(reformulate(group, combination), data = df)
+    p_value <- test_result$p.value
+    p_value_formatted <- formatC(p_value, format = "e", digits = 2)
+  }
   
   # Calculate and print medians for each group
   medians <- df %>%
@@ -5546,7 +7651,8 @@ extract_info_fields <- function(df) {
     mutate(
       source = str_extract(INFO, "TD_SRC=[^;]+") %>% str_replace("TD_SRC=", ""),
       subtype = str_extract(INFO, "SUBTYPE=[^;]+") %>% str_replace("SUBTYPE=", ""),
-      length = str_extract(INFO, "AVG_LEN=[^;]+") %>% str_replace("AVG_LEN=", "")
+      length = str_extract(INFO, "AVG_LEN=[^;]+") %>% str_replace("AVG_LEN=", ""),
+      seq = str_extract(INFO, "SVINSSEQ=[^;]+") %>% str_replace("SVINSSEQ=", "")
     )
   return(df)
 }
@@ -6857,6 +8963,102 @@ fisher_test_unique_te <- function(data, min) {
   return(results)
 }
 
+fisher_test_by_tumor_type <- function(data, min_samples_tt = 3, min_samples_te=5) {
+  
+  # Step 1: Collapse rare tumor types into "Other"
+  tumor_type_counts <- data %>%
+    distinct(sample, tumor_type) %>%
+    count(tumor_type, name = "n")
+  
+  common_tumors <- tumor_type_counts %>%
+    filter(n >= min_samples_tt) %>%
+    pull(tumor_type)
+  
+  data <- data %>%
+    filter(!is.na(tumor_type)) %>%
+    mutate(tumor_type_grouped = ifelse(tumor_type %in% common_tumors, tumor_type, "Other"))
+
+  # Step 2: Group and run Fisher's test for each TE
+  # Filter TEs that appear in fewer than min_samples_te unique samples
+  data <- data %>%
+    group_by(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
+    filter(n_distinct(sample) >= min_samples_te) %>%
+    ungroup()
+
+  # Check if data is empty after filtering
+  if (nrow(data) == 0) {
+    cat("Warning: No TEs remain after filtering. Returning empty results.\n")
+    return(data.frame(SV_chrom = character(0), SV_start = numeric(0), SV_end = numeric(0),
+                      SV_length = numeric(0), ALT = character(0), fisher_p_value = numeric(0),
+                      fisher_p_value_BH = numeric(0)))
+  }
+
+  # Create sample-tumor map for the entire dataset
+  all_sample_tumor_map <- data %>%
+    distinct(sample, tumor_type_grouped)
+
+  results <- data %>%
+    group_by(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
+    do({
+      this_data <- .
+
+      # Determine which samples in this group have the current TE
+      has_te_samples <- this_data %>% distinct(sample) %>% pull(sample)
+
+      # Merge and create binary presence
+      contingency_data <- all_sample_tumor_map %>%
+        mutate(has_variant = ifelse(sample %in% has_te_samples, "Present", "Absent")) %>%
+        count(tumor_type_grouped, has_variant) %>%
+        tidyr::pivot_wider(names_from = has_variant, values_from = n, values_fill = 0)
+
+      # Ensure both columns exist for Fisher test BEFORE converting to rownames
+      if (!"Present" %in% colnames(contingency_data)) contingency_data$Present <- 0
+      if (!"Absent" %in% colnames(contingency_data)) contingency_data$Absent <- 0
+
+      # Only convert to rownames if we have valid data
+      if (nrow(contingency_data) == 0 || any(is.na(contingency_data$tumor_type_grouped))) {
+        return(data.frame(fisher_p_value = NA))
+      }
+
+      contingency_data <- contingency_data %>% column_to_rownames("tumor_type_grouped")
+
+      # get p value
+      fisher_p <- tryCatch({
+        fisher.test(contingency_data)$p.value
+      }, error = function(e) NA)
+
+      # Get gene names and other annotations from the first row
+      gene_names <- paste(unique(this_data$Gene_name), collapse = ";")
+      location <- paste(unique(this_data$Location), collapse = ";")
+      n_samples <- n_distinct(this_data$sample)
+
+      data.frame(
+        fisher_p_value = fisher_p,
+        gene_names = gene_names,
+        location = location,
+        n_samples = n_samples
+      )
+    }) %>%
+    ungroup() %>%
+    filter(!is.na(fisher_p_value))
+
+  # Step 3: Adjust p-values (only if there are results)
+  if (nrow(results) > 0) {
+    results$fisher_p_value_BH <- p.adjust(results$fisher_p_value, method = "BH")
+  } else {
+    cat("Warning: No valid Fisher test results. Returning empty dataframe.\n")
+    return(data.frame(SV_chrom = character(0), SV_start = numeric(0), SV_end = numeric(0),
+                      SV_length = numeric(0), ALT = character(0), fisher_p_value = numeric(0),
+                      fisher_p_value_BH = numeric(0)))
+  }
+  
+  # Step 4: Return sorted results
+  results <- results %>% arrange(fisher_p_value_BH)
+  
+  return(results)
+}
+
+
 find_sig_te_samples <- function(sig_df, te_df) {
   # Define the columns you want to retain in the results
   selected_columns <- c("sample", "AnnotSV_ID", "SV_chrom", "SV_start", "SV_end", 
@@ -6944,6 +9146,169 @@ print_summary_sig_te_samples<- function(df) {
   }
 }
 
+get_sig_te_contingency_tables <- function(data, sig_results, min_samples_tt) {
+  # Group rare tumor types into "Other"
+  tumor_type_counts <- data %>%
+    distinct(sample, tumor_type) %>%
+    count(tumor_type, name = "n")
+
+  common_tumors <- tumor_type_counts %>%
+    filter(n >= min_samples_tt) %>%
+    pull(tumor_type)
+
+  data <- data %>%
+    filter(!is.na(tumor_type)) %>%
+    mutate(tumor_type_grouped = ifelse(tumor_type %in% common_tumors, tumor_type, "Other"))
+
+  # Build contingency table for each row (TE) in sig_results
+  sig_results_with_tables <- sig_results %>%
+    rowwise() %>%
+    mutate(contingency_table = list({
+      # Extract current row as a list
+      te <- cur_data()
+
+      # Filter matching rows in full dataset
+      this_data <- data %>%
+        filter(SV_chrom == te$SV_chrom,
+               SV_start == te$SV_start,
+               SV_end == te$SV_end,
+               SV_length == te$SV_length,
+               ALT == te$ALT)
+
+      has_te_samples <- this_data %>%
+        distinct(sample) %>%
+        pull(sample)
+
+      sample_tumor_map <- data %>%
+        distinct(sample, tumor_type_grouped)
+
+      contingency_data <- sample_tumor_map %>%
+        filter(!is.na(tumor_type_grouped)) %>%
+        mutate(has_variant = ifelse(sample %in% has_te_samples, "Present", "Absent")) %>%
+        count(tumor_type_grouped, has_variant) %>%
+        tidyr::pivot_wider(names_from = has_variant, values_from = n, values_fill = 0)
+
+      # Ensure both columns exist BEFORE converting to rownames
+      if (!"Present" %in% colnames(contingency_data)) contingency_data$Present <- 0
+      if (!"Absent" %in% colnames(contingency_data)) contingency_data$Absent <- 0
+
+      # Only convert to rownames if valid
+      if (nrow(contingency_data) > 0 && !any(is.na(contingency_data$tumor_type_grouped))) {
+        contingency_data <- contingency_data %>% column_to_rownames("tumor_type_grouped")
+      } else {
+        return(matrix(NA, nrow = 0, ncol = 0))
+      }
+
+      as.matrix(contingency_data)
+    })) %>%
+    ungroup()
+
+  return(sig_results_with_tables)
+}
+
+# Convert contingency tables to long format suitable for CSV export
+# Returns a data frame with one row per TE-tumor_type combination
+get_sig_te_contingency_tables_long <- function(data, sig_results, min_samples_tt) {
+  # Group rare tumor types into "Other"
+  tumor_type_counts <- data %>%
+    distinct(sample, tumor_type) %>%
+    count(tumor_type, name = "n")
+
+  common_tumors <- tumor_type_counts %>%
+    filter(n >= min_samples_tt) %>%
+    pull(tumor_type)
+
+  data <- data %>%
+    filter(!is.na(tumor_type)) %>%
+    mutate(tumor_type_grouped = ifelse(tumor_type %in% common_tumors, tumor_type, "Other"))
+
+  # Get all unique tumor types for consistency
+  all_tumor_types <- unique(data$tumor_type_grouped)
+
+  # For each significant TE, get counts by tumor type
+  result_list <- list()
+
+  for (i in 1:nrow(sig_results)) {
+    te <- sig_results[i, ]
+
+    # Filter matching rows in full dataset
+    this_data <- data %>%
+      filter(SV_chrom == te$SV_chrom,
+             SV_start == te$SV_start,
+             SV_end == te$SV_end,
+             SV_length == te$SV_length,
+             ALT == te$ALT)
+
+    has_te_samples <- this_data %>%
+      distinct(sample) %>%
+      pull(sample)
+
+    sample_tumor_map <- data %>%
+      distinct(sample, tumor_type_grouped)
+
+    # Create contingency data in long format
+    contingency_long <- sample_tumor_map %>%
+      filter(!is.na(tumor_type_grouped)) %>%
+      mutate(has_variant = ifelse(sample %in% has_te_samples, "Present", "Absent")) %>%
+      count(tumor_type_grouped, has_variant) %>%
+      tidyr::pivot_wider(names_from = has_variant, values_from = n, values_fill = 0)
+
+    # Ensure both columns exist
+    if (!"Present" %in% colnames(contingency_long)) contingency_long$Present <- 0
+    if (!"Absent" %in% colnames(contingency_long)) contingency_long$Absent <- 0
+
+    # Add TE information and stats
+    contingency_long <- contingency_long %>%
+      mutate(
+        SV_chrom = te$SV_chrom,
+        SV_start = te$SV_start,
+        SV_end = te$SV_end,
+        SV_length = te$SV_length,
+        ALT = te$ALT,
+        fisher_p_value = te$fisher_p_value,
+        fisher_p_value_BH = te$fisher_p_value_BH,
+        total_samples = Present + Absent,
+        percent_present = round(100 * Present / (Present + Absent), 2)
+      ) %>%
+      select(SV_chrom, SV_start, SV_end, SV_length, ALT,
+             tumor_type = tumor_type_grouped,
+             present = Present, absent = Absent, total_samples, percent_present,
+             fisher_p_value, fisher_p_value_BH)
+
+    result_list[[i]] <- contingency_long
+  }
+
+  # Combine all results
+  result_df <- dplyr::bind_rows(result_list)
+
+  return(result_df)
+}
+
+
+get_samples_with_sig_te <- function(data, sig_results) {
+  sig_results_with_samples <- sig_results %>%
+    rowwise() %>%
+    mutate(samples_with_te = list({
+      chr    <- SV_chrom
+      start  <- SV_start
+      end    <- SV_end
+      length <- SV_length
+      alt    <- ALT
+      
+      data %>%
+        filter(SV_chrom == chr,
+               SV_start == start,
+               SV_end == end,
+               SV_length == length,
+               ALT == alt) %>%
+        distinct(sample) %>%
+        pull(sample)
+    })) %>%
+    ungroup()
+  
+  return(sig_results_with_samples)
+}
+
 find_sig_te_genes <- function(sig_df, te_df) {
   # Define the columns you want to retain in the results
   selected_columns <- c("sample", "AnnotSV_ID", "SV_chrom", "SV_start", "SV_end", 
@@ -6999,4 +9364,3394 @@ find_sig_te_genes <- function(sig_df, te_df) {
   return(final_result)
 }
 
+combine_gene_expression <- function(df1, df2) {
+  # Merge the two data frames by 'gene_name'
+  combined_df <- merge(df1, df2, by = "gene_name", all = TRUE)
+  
+  # Replace NA values with 0
+  combined_df[is.na(combined_df)] <- 0
+  
+  return(combined_df)
+  
+}
 
+rename_lfs_rna_columns <- function(rna_df, names_df) {
+  # Create a named vector for renaming
+  rename_map <- setNames(names_df$sample, names_df$rna_sample)
+  
+  # Rename columns in rna_df using the mapping
+  colnames(rna_df) <- ifelse(colnames(rna_df) %in% names(rename_map), 
+                             rename_map[colnames(rna_df)], 
+                             colnames(rna_df))
+  
+  return(rna_df)
+}
+
+rename_stjude_rna <- function(df) {
+  colnames(df)[-1] <- paste0(sub("_.*", "", colnames(df)[-1]), "_T")
+  return(df)
+}
+
+rename_kics_rna<- function(rna_df, naming_df) {
+  # Extract current column names from the RNA dataframe
+  rna_names <- colnames(rna_df)
+  
+  # Separate gene_name column and other RNA columns
+  gene_name_col <- rna_names[1]  # Assuming gene_name is the first column
+  other_rna_cols <- rna_names[-1]  # This gets all columns EXCEPT the first one
+  
+  # Find which RNA names from the columns have mappings in the naming dataframe
+  # Hardcoded to use "rna_name" column in naming_df
+  matched_indices <- match(other_rna_cols, naming_df[["rna_name"]])
+  
+  # Identify which columns to keep (those with a match in naming_df)
+  columns_to_keep <- !is.na(matched_indices)
+  
+  # Create a vector of column indices to keep (including gene_name)
+  columns_to_keep_indices <- c(1, which(columns_to_keep) + 1)
+  
+  # Filter the dataframe to keep only columns with matches and the gene_name column
+  filtered_df <- rna_df[, columns_to_keep_indices, drop = FALSE]
+  
+  # Get the new column names from the mapping
+  # Hardcoded to use "sample" column in naming_df
+  new_colnames <- c(gene_name_col, naming_df[["sample"]][matched_indices[columns_to_keep]])
+  
+  # Rename the columns
+  colnames(filtered_df) <- new_colnames
+  
+  # Return the modified dataframe
+  return(filtered_df)
+}
+
+filter_columns_by_sample <- function(main_df, reference_df) {
+  # Get column names from main_df
+  col_names <- colnames(main_df)
+  
+  # Check which column names are in the reference_df$sample
+  cols_to_keep <- col_names %in% reference_df$sample
+  
+  # Return filtered dataframe
+  return(main_df[, cols_to_keep, drop = FALSE])
+}
+
+split_re_gene_rows <- function(df, gene_col = "RE_gene", sep = ";") {
+  df %>%
+    separate_rows(!!sym(gene_col), sep = sep) %>%
+    mutate(!!gene_col := str_trim(!!sym(gene_col)))
+}
+
+plot_gene_effects <- function(df, min_sample_tt = 5, remove_other = FALSE, top_n_genes = 10, SV_type = NULL, RE = FALSE, cancer_genes=FALSE) {
+  # Filter by SV_type if provided
+  if (!is.null(SV_type)) {
+    df <- df %>% filter(ALT == SV_type)
+  }
+
+  # Add a new column `tumor_type_other` to group tumor types into "Other"
+  df <- df %>%
+    group_by(tumor_type) %>%
+    mutate(tumor_type_other = ifelse(n_distinct(sample) < min_sample_tt, "Other", tumor_type)) %>%
+    ungroup()
+  
+  # If RE is TRUE, preprocess RE_gene and use it instead of Gene_name
+  if (RE) {
+    df <- df %>%
+      mutate(RE_gene = sub(" \\(.*$", "", RE_gene)) # Extract everything before " ("
+  }
+  
+  # If cancer_genes is provided, filter by RE_gene_symbol
+  if (!isFALSE(cancer_genes)) {
+    df <- df %>% filter(RE_gene %in% cancer_genes)
+  }
+  
+  # Determine the column to use for grouping genes
+  gene_column <- if (RE) "RE_gene" else "Gene_name"
+  
+  # Count unique samples per gene and tumor type, filter top genes, and optionally remove "Other"
+  gene_counts <- df %>%
+    distinct(sample, .data[[gene_column]], tumor_type_other) %>%
+    group_by(.data[[gene_column]], tumor_type_other) %>%
+    summarise(sample_count = n_distinct(sample), .groups = "drop") %>%
+    group_by(.data[[gene_column]]) %>%
+    mutate(total_samples = sum(sample_count)) %>%
+    ungroup() %>%
+    arrange(desc(total_samples)) %>%
+    filter(.data[[gene_column]] %in% head(unique(.data[[gene_column]]), top_n_genes)) %>%
+    filter(!(remove_other & tumor_type_other == "Other"))
+  
+  # Rename the gene column for consistent plotting
+  colnames(gene_counts)[1] <- "Gene"
+  
+  print(head(gene_counts))
+  # Plot the stacked bar plot
+  p <- ggplot(gene_counts, aes(x = reorder(Gene, -total_samples), y = sample_count, fill = tumor_type_other)) +
+    geom_bar(stat = "identity") +
+    labs(x = "Gene", y = "Number of samples affected", fill = "Tumor type") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  return(p)
+}
+
+# Filter false positive transposable element insertions using manual IGV review data
+# - Removes all two-caller FPs listed in l1_merge_fp
+# - For samples with Filtered_true="Y": keeps only TPs from unique_l1_tp
+# - For samples with Filtered_true=blank: removes FPs from unique_l1_fp
+# - Excludes samples not present in unique_l1_master (unreviewed)
+filter_false_positives <- function(te_data, l1_merge_fp, unique_l1_tp, unique_l1_fp, unique_l1_master, check_missing_ids = TRUE) {
+  
+  # Use r_dir from global environment if available, otherwise current directory
+  output_dir <- if(exists("r_dir")) r_dir else "."
+  
+  # l1_merge_fp should already be loaded as data.frame from fread
+  cat("Filtering false positives using manual review data...\n")
+  
+  # Clear validation warnings file for fresh start
+  if (exists("r_dir_files")) {
+    validation_warnings_file <- file.path(r_dir_files, "validation_warnings.txt")
+    if (file.exists(validation_warnings_file)) {
+      file.remove(validation_warnings_file)
+    }
+  }
+  
+  # Create sample column if it doesn't exist (extract from ID)
+  if (!"sample" %in% colnames(te_data)) {
+    if ("ID" %in% colnames(te_data)) {
+      # Extract sample from ID format: "0453_20-10584-A-02-00_T-1-56405386-1537-LINE1"
+      # Pattern: everything up to and including "_T", then followed by a dash and numbers/letters
+      te_data$sample <- sub("^(.+_T)-.*", "\\1", te_data$ID)
+    } else {
+      stop("Cannot create sample column - no ID column found")
+    }
+  }
+
+  # Check for missing IDs BEFORE any filtering (only if requested)
+  if (check_missing_ids) {
+    # Only check TP IDs since FPs will be intentionally removed
+    tp_ids <- unique_l1_tp$ID[!is.na(unique_l1_tp$ID)]
+    missing_tp_ids <- tp_ids[!(tp_ids %in% te_data$ID)]
+
+    # Filter out short IDs (length < 50) - these are likely truncated or malformed
+    if (length(missing_tp_ids) > 0) {
+      missing_tp_ids_long <- missing_tp_ids[nchar(missing_tp_ids) >= 50]
+    } else {
+      missing_tp_ids_long <- character(0)
+    }
+
+    # Write missing TP IDs to file if any found
+    if (length(missing_tp_ids_long) > 0) {
+      missing_file <- file.path(r_dir_files, "missing_ids_in_te_data.txt")
+
+      # Add diagnostic info to the file
+      diagnostic_info <- c(
+        paste0("# Missing True Positive IDs (", length(missing_tp_ids_long), " total)"),
+        paste0("# These IDs are in unique_l1_tp.csv but not found in the main te_data file"),
+        paste0("# Total TPs in review file: ", length(tp_ids)),
+        paste0("# Total IDs in te_data: ", nrow(te_data)),
+        paste0("# Missing IDs (length >= 50):"),
+        "",
+        missing_tp_ids_long
+      )
+      writeLines(diagnostic_info, missing_file)
+      cat("WARNING:", length(missing_tp_ids_long), "true positive IDs from review files not found in te_data. Written to:", missing_file, "\n")
+    } else {
+      cat("SUCCESS: All reviewed true positive IDs found in te_data\n")
+    }
+  }
+
+  # Check for samples that haven't been reviewed yet
+  te_samples <- unique(trimws(as.character(te_data$sample)))
+  te_samples <- te_samples[!is.na(te_samples) & te_samples != ""]
+  reviewed_samples <- unique(trimws(as.character(unique_l1_master$sample)))
+  unreviewed_samples <- te_samples[!(te_samples %in% reviewed_samples)]
+  
+  cat("Sample review status: Found", length(te_samples), "TE samples,", length(reviewed_samples), "reviewed,", length(unreviewed_samples), "unreviewed\n")
+  
+  # Print and exclude unreviewed samples
+  if (length(unreviewed_samples) > 0) {
+    # Write unreviewed samples to file
+    unreviewed_file <- file.path(r_dir_files, "unreviewed_samples_excluded.txt")
+    writeLines(unreviewed_samples, unreviewed_file)
+    cat("WARNING:", length(unreviewed_samples), "samples not reviewed and removed from analysis. Written to:", unreviewed_file, "\n")
+
+    # Remove unreviewed samples from te_data
+    te_data <- te_data[!(trimws(as.character(sample)) %in% unreviewed_samples)]
+  } else {
+    cat("SUCCESS: All samples have been reviewed - no unreviewed samples excluded\n")
+  }
+  
+  # Calculate masks AFTER removing unreviewed samples
+  # One-caller: contains "xtea" or "totalrecall" in ID
+  # Two-caller: does not contain these terms
+  one_caller_mask <- grepl("xtea|totalrecall", te_data$ID, ignore.case = TRUE)
+  two_caller_mask <- !one_caller_mask
+
+  cat("Caller types:", sum(one_caller_mask), "one-caller,", sum(two_caller_mask), "two-caller insertions\n")
+  cat("Samples after unreviewed removal:", length(unique(te_data$sample)), "samples\n")
+  
+  remove_ids <- character(0)
+  
+  # 1. Filter ALL FP calls by two callers listed in l1_merge_fp
+  two_caller_fps <- l1_merge_fp$ID[!is.na(l1_merge_fp$ID)]
+  remove_ids <- c(remove_ids, as.character(two_caller_fps))
+  cat("Two-caller FP removal:", sum(te_data$ID %in% two_caller_fps), "of", length(two_caller_fps), "FPs found in data\n")
+  
+  # 2. Filter one-caller calls based on sample-specific rules from unique_l1_master
+  te_samples_clean <- trimws(as.character(te_data$sample))
+  master_samples_clean <- trimws(as.character(unique_l1_master$sample))
+  reviewed_samples_in_data <- unique(te_samples_clean[te_samples_clean %in% master_samples_clean])
+  
+  cat("One-caller sample-specific filtering for", length(reviewed_samples_in_data), "reviewed samples\n")
+  
+  for (sample_id in reviewed_samples_in_data) {
+    # Get filtering rule for this sample from unique_l1_master
+    sample_master_row <- unique_l1_master[trimws(as.character(unique_l1_master$sample)) == sample_id, ]
+    
+    # Handle case where sample might appear multiple times - take first occurrence
+    if (nrow(sample_master_row) > 1) {
+      sample_master_row <- sample_master_row[1, ]
+    }
+    
+    # Get all one-caller TE IDs for this sample (don't touch two-caller calls)
+    sample_one_caller_ids <- te_data$ID[trimws(as.character(te_data$sample)) == sample_id & one_caller_mask]
+    
+    if (nrow(sample_master_row) > 0) {
+      filtered_true_status <- sample_master_row$Filtered_true
+      
+      # Additional validation logic based on number false/true columns
+      if ("number_false" %in% colnames(sample_master_row) && "number_true" %in% colnames(sample_master_row) && "sum_unique" %in% colnames(sample_master_row)) {
+        num_false <- as.numeric(sample_master_row$number_false)
+        num_true <- as.numeric(sample_master_row$number_true) 
+        sum_unique <- as.numeric(sample_master_row$sum_unique)
+        
+        # Skip filtering if no false positives
+        if (!is.na(num_false) && num_false == 0) {
+          #cat("Sample", sample_id, ": No false positives, skipping filtering\n")
+          next
+        }
+        
+        # Filter out all if all are false positives  
+        if (!is.na(num_false) && !is.na(sum_unique) && num_false == sum_unique) {
+          #cat("Sample", sample_id, ": All TEs are false positives, removing all\n")
+          sample_ids_to_remove <- sample_one_caller_ids
+          remove_ids <- c(remove_ids, as.character(sample_ids_to_remove))
+          next
+        }
+        
+        # Validate counts match review files
+        if (!is.na(filtered_true_status) && trimws(as.character(filtered_true_status)) == "Y") {
+          sample_tps_count <- sum(trimws(as.character(unique_l1_tp$sample)) == sample_id & !is.na(unique_l1_tp$ID))
+          if (!is.na(num_true) && sample_tps_count != num_true) {
+            warning_msg <- paste("Sample", sample_id, ": Mismatch in true positives. Master file:", num_true, "vs unique_l1_tp:", sample_tps_count)
+            cat("WARNING:", warning_msg, "\n")
+            warning_file <- file.path(r_dir_files, "validation_warnings.txt")
+            write(warning_msg, warning_file, append = TRUE)
+          }
+        } else if (is.na(filtered_true_status) || trimws(as.character(filtered_true_status)) == "") {
+          sample_fps_count <- sum(trimws(as.character(unique_l1_fp$sample)) == sample_id & !is.na(unique_l1_fp$ID))
+          if (!is.na(num_false) && sample_fps_count != num_false) {
+            warning_msg <- paste("Sample", sample_id, ": Mismatch in false positives. Master file:", num_false, "vs unique_l1_fp:", sample_fps_count)
+            cat("WARNING:", warning_msg, "\n")
+            warning_file <- file.path(r_dir_files, "validation_warnings.txt")
+            write(warning_msg, warning_file, append = TRUE)
+          }
+        }
+      }
+      
+      if (!is.na(filtered_true_status) && trimws(as.character(filtered_true_status)) == "Y") {
+        # For Filtered_true = Y: Only keep TPs listed in unique_l1_tp for this sample
+        sample_tps <- as.character(unique_l1_tp$ID[trimws(as.character(unique_l1_tp$sample)) == sample_id & !is.na(unique_l1_tp$ID)])
+        
+        # Remove all other one-caller calls from this sample (except TPs)
+        sample_ids_to_remove <- sample_one_caller_ids[!(sample_one_caller_ids %in% sample_tps)]
+        remove_ids <- c(remove_ids, as.character(sample_ids_to_remove))
+        
+      } else if (is.na(filtered_true_status) || trimws(as.character(filtered_true_status)) == "") {
+        # For Filtered_true = blank: Remove FPs listed in unique_l1_fp for this sample
+        sample_fps <- as.character(unique_l1_fp$ID[trimws(as.character(unique_l1_fp$sample)) == sample_id & !is.na(unique_l1_fp$ID)])
+        
+        # Remove only the specific one-caller FPs
+        sample_fps_to_remove <- sample_one_caller_ids[sample_one_caller_ids %in% sample_fps]
+        remove_ids <- c(remove_ids, as.character(sample_fps_to_remove))
+        
+      }
+    }
+  }
+  
+  # Debug: Check if remove_ids actually match anything in te_data
+  if (length(remove_ids) > 0) {
+    matching_ids <- sum(te_data$ID %in% remove_ids)
+    cat("Final removal summary:\n")
+    cat("- Unique IDs marked for removal:", length(unique(remove_ids)), "\n")
+    cat("- IDs in te_data that match remove_ids:", matching_ids, "\n")
+    
+    if (matching_ids == 0) {
+      cat("WARNING: No matching IDs found! Checking ID formats...\n")
+      cat("- First few remove_ids:", paste(head(remove_ids, 3), collapse = ", "), "\n")
+      cat("- First few te_data IDs:", paste(head(te_data$ID, 3), collapse = ", "), "\n")
+      cat("- te_data ID class:", class(te_data$ID), "\n")
+      cat("- remove_ids class:", class(remove_ids), "\n")
+    }
+  }
+  
+  # Filter te_data: remove all IDs in remove_ids
+  te_filtered <- te_data[!(ID %in% remove_ids)]
+  
+  # Print detailed filtering summary by caller type
+  if ("caller_cat" %in% colnames(te_data)) {
+    # Original counts by caller type
+    original_one_caller <- nrow(te_data[caller_cat == "one_caller"])
+    original_two_caller <- nrow(te_data[caller_cat == "two_caller"])
+    
+    # Filtered counts by caller type
+    filtered_one_caller <- nrow(te_filtered[caller_cat == "one_caller"])
+    filtered_two_caller <- nrow(te_filtered[caller_cat == "two_caller"])
+    
+    cat("Detailed filtering summary by caller type:\n")
+    cat("- One-caller: ", original_one_caller, " → ", filtered_one_caller, " (removed ", original_one_caller - filtered_one_caller, ", ", round(100*filtered_one_caller/original_one_caller, 1), "% retention)\n", sep = "")
+    cat("- Two-caller: ", original_two_caller, " → ", filtered_two_caller, " (removed ", original_two_caller - filtered_two_caller, ", ", round(100*filtered_two_caller/original_two_caller, 1), "% retention)\n", sep = "")
+  }
+  
+  # Print overall filtering summary
+  cat("Filtering complete:", nrow(te_data), "→", nrow(te_filtered), "insertions (removed", nrow(te_data) - nrow(te_filtered), ")\n")
+  
+  # Safety check for empty dataset
+  if (nrow(te_filtered) == 0) {
+    cat("WARNING: All data was filtered out! This may cause downstream processing to fail.\n")
+  }
+  
+  return(te_filtered)
+}
+
+test_all_te_expression_effects <- function(rna_df, te_split_df, min_samples = 5, fdr_cutoff = 0.05, group_by_gene = FALSE) {
+  cat("Systematic TE expression analysis\n")
+  cat("Minimum samples per TE:", min_samples, "\n")
+  cat("FDR cutoff:", fdr_cutoff, "\n")
+
+  # Check input types
+  if (!is.data.frame(te_split_df)) {
+    cat("Error: te_split_df is not a data frame. Class:", class(te_split_df), "\n")
+    return(data.frame())
+  }
+  if (!is.data.frame(rna_df)) {
+    cat("Error: rna_df is not a data frame. Class:", class(rna_df), "\n")
+    return(data.frame())
+  }
+
+  # Clean sample names
+  te_split_df$sample_clean <- sub("_.*", "", te_split_df$sample)
+
+  # Identify unique TEs by genomic coordinates and type (optionally grouped by gene)
+  if (group_by_gene) {
+    cat("Identifying unique TE insertions grouped by gene...\n")
+    te_sample_counts <- te_split_df %>%
+      group_by(Gene_name, ALT) %>%
+      summarise(
+        num_samples = n_distinct(sample_clean),
+        te_coordinates = paste(unique(paste(SV_chrom, SV_start, SV_end, sep=":")), collapse=";"),
+        samples_with_te = paste(unique(sample_clean), collapse=";"),
+        te_location = paste(unique(na.omit(Location)), collapse="; "),
+        gene_features = paste(unique(na.omit(Location2)), collapse="; "),
+        .groups = "drop"
+      ) %>%
+      filter(num_samples >= min_samples) %>%
+      arrange(desc(num_samples))
+  } else {
+    cat("Identifying unique TE insertions...\n")
+    te_sample_counts <- te_split_df %>%
+      group_by(SV_chrom, SV_start, SV_end, SV_length, ALT) %>%
+      summarise(
+        num_samples = n_distinct(sample_clean),
+        genes_affected = paste(unique(Gene_name), collapse=";"),
+        samples_with_te = paste(unique(sample_clean), collapse=";"),
+        te_location = paste(unique(na.omit(Location)), collapse="; "),
+        gene_features = paste(unique(na.omit(Location2)), collapse="; "),
+        .groups = "drop"
+      ) %>%
+      filter(num_samples >= min_samples) %>%
+      arrange(desc(num_samples))
+  }
+  
+  cat("TEs with ≥", min_samples, "samples:", nrow(te_sample_counts), "\n")
+  
+  if (nrow(te_sample_counts) == 0) {
+    cat("No TEs meet minimum sample threshold. Returning empty results.\n")
+    return(data.frame())
+  }
+
+  # Get all unique samples from RNA data (not just TE samples)
+  # This includes samples with NO TEs as valid controls
+  rna_samples <- colnames(rna_df)[-1]  # Exclude gene_name column
+  rna_base_ids <- unique(sub("_.*", "", rna_samples))
+  cat("Total samples available in RNA data:", length(rna_base_ids), "\n")
+  cat("Samples with gene-associated TEs:", length(unique(te_split_df$sample_clean)), "\n")
+  
+  # Prepare results dataframe
+  results <- data.frame()
+  
+  cat("Testing TE effects on gene expression...\n")
+  
+  for (i in 1:nrow(te_sample_counts)) {
+    te_info <- te_sample_counts[i, ]
+
+    samples_with_te <- unlist(strsplit(te_info$samples_with_te, ";"))
+    # Use ALL RNA samples as potential controls, not just those with gene-associated TEs
+    samples_without_te <- setdiff(rna_base_ids, samples_with_te)
+    
+    if (group_by_gene) {
+      # When grouping by gene, each row is a gene-TE type combination
+      genes_affected <- te_info$Gene_name
+      # Suppressed verbose TE iteration output
+    } else {
+      # Original mode: split genes affected by this TE
+      genes_affected <- unlist(strsplit(te_info$genes_affected, ";"))
+      # Suppressed verbose TE iteration output
+    }
+    
+    # Test each gene affected by this TE
+    for (gene in genes_affected) {
+      gene <- trimws(gene)  # Remove whitespace
+      
+      # Check if gene exists in RNA data
+      first_col_name <- names(rna_df)[1]
+      if (!gene %in% rna_df[[first_col_name]]) {
+        # Suppressed verbose gene lookup messages
+        next
+      }
+      
+      # Get expression data for this gene
+      gene_expr_row <- rna_df[rna_df[[first_col_name]] == gene, ]
+      
+      # Match RNA samples with TE samples
+      rna_samples <- colnames(rna_df)[-1]  # Exclude gene_name column
+      
+      # Extract base IDs from RNA sample names for matching with TE data
+      rna_base_ids <- sub("_.*", "", rna_samples)
+      
+      # Find RNA samples that match TE samples (by base ID)
+      matched_with_te_indices <- which(rna_base_ids %in% samples_with_te)
+      matched_without_te_indices <- which(rna_base_ids %in% samples_without_te)
+      
+      matched_with_te <- rna_samples[matched_with_te_indices]
+      matched_without_te <- rna_samples[matched_without_te_indices]
+      
+      
+      if (length(matched_with_te) < min_samples || length(matched_without_te) < min_samples) {
+        # Suppressed insufficient samples message
+        next
+      }
+      
+      # Extract expression values
+      expr_with_te <- as.numeric(gene_expr_row[, matched_with_te])
+      expr_without_te <- as.numeric(gene_expr_row[, matched_without_te])
+      
+      # Remove any NA values
+      expr_with_te <- expr_with_te[!is.na(expr_with_te)]
+      expr_without_te <- expr_without_te[!is.na(expr_without_te)]
+      
+      if (length(expr_with_te) < min_samples || length(expr_without_te) < min_samples) {
+        # Suppressed insufficient non-NA samples message
+        next
+      }
+      
+      # Perform Wilcoxon test
+      tryCatch({
+        wilcox_result <- wilcox.test(expr_with_te, expr_without_te)
+
+        # Calculate medians and means
+        median_with_te <- median(expr_with_te)
+        median_without_te <- median(expr_without_te)
+        mean_with_te <- mean(expr_with_te)
+        mean_without_te <- mean(expr_without_te)
+        fold_change <- median_with_te / (median_without_te + 0.001)  # Add small value to avoid division by zero
+
+        # Determine effect direction
+        effect_direction <- ifelse(median_with_te > median_without_te, "Up", "Down")
+
+        # Determine TE location type
+        te_location_str <- te_info$te_location
+        te_location_type <- case_when(
+          grepl("exon", te_location_str, ignore.case = TRUE) & grepl("intron", te_location_str, ignore.case = TRUE) ~ "Both exonic & intronic",
+          grepl("exon", te_location_str, ignore.case = TRUE) ~ "Exonic",
+          grepl("intron", te_location_str, ignore.case = TRUE) ~ "Intronic",
+          TRUE ~ "Other"
+        )
+
+        # Store results
+        if (group_by_gene) {
+          result_row <- data.frame(
+            gene = gene,
+            te_type = te_info$ALT,
+            te_coordinates = te_info$te_coordinates,
+            te_location_type = te_location_type,
+            te_location = te_info$te_location,
+            gene_features = te_info$gene_features,
+            samples_with_te = length(matched_with_te),
+            samples_without_te = length(matched_without_te),
+            median_with_te = median_with_te,
+            median_without_te = median_without_te,
+            mean_with_te = mean_with_te,
+            mean_without_te = mean_without_te,
+            fold_change = fold_change,
+            effect_direction = effect_direction,
+            p_value = wilcox_result$p.value,
+            stringsAsFactors = FALSE
+          )
+        } else {
+          result_row <- data.frame(
+            te_chrom = te_info$SV_chrom,
+            te_start = te_info$SV_start,
+            te_end = te_info$SV_end,
+            te_length = te_info$SV_length,
+            te_type = te_info$ALT,
+            gene = gene,
+            te_location_type = te_location_type,
+            te_location = te_info$te_location,
+            gene_features = te_info$gene_features,
+            samples_with_te = length(matched_with_te),
+            samples_without_te = length(matched_without_te),
+            median_with_te = median_with_te,
+            median_without_te = median_without_te,
+            mean_with_te = mean_with_te,
+            mean_without_te = mean_without_te,
+            fold_change = fold_change,
+            effect_direction = effect_direction,
+            p_value = wilcox_result$p.value,
+            stringsAsFactors = FALSE
+          )
+        }
+
+        results <- rbind(results, result_row)
+
+        # Suppressed verbose gene test output
+
+      }, error = function(e) {
+        # Suppressed verbose error output
+      })
+    }
+  }
+  
+  if (nrow(results) == 0) {
+    cat("No successful tests completed.\n")
+    return(data.frame())
+  }
+  
+  # Apply FDR correction
+  cat("Applying FDR correction...\n")
+  results$p_adj <- p.adjust(results$p_value, method = "fdr")
+  
+  # Sort by adjusted p-value
+  results <- results[order(results$p_adj), ]
+  
+  # Identify significant results
+  significant_results <- results[results$p_adj < fdr_cutoff, ]
+  
+  cat("Results summary:\n")
+  cat("Total tests performed:", nrow(results), "\n")
+  cat("Significant results (FDR <", fdr_cutoff, "):", nrow(significant_results), "\n")
+  
+  if (nrow(significant_results) > 0) {
+    cat("\nSignificant TE-gene expression associations:\n")
+    for (i in 1:min(10, nrow(significant_results))) {
+      row <- significant_results[i, ]
+      cat(sprintf("  %s (chr%d:%d-%d) → %s: FC=%.2f, p_adj=%.2e\n", 
+                  row$te_type, row$te_chrom, row$te_start, row$te_end,
+                  row$gene, row$fold_change, row$p_adj))
+    }
+  }
+  
+  return(results)
+}
+
+# Helper function to extract full sample name from TE ID column
+extract_full_sample_from_te_id <- function(te_id) {
+  # For TE IDs like "0197_20-15931-A-02-00_T-totalrecall-1-245334-844-LINE1"
+  # Extract the sample part: "0197_20-15931-A-02-00_T"
+  # Split by "-" and take parts before the method name
+  
+  if (is.na(te_id) || te_id == "") return(te_id)
+  
+  # Look for pattern: sample_ID followed by method (totalrecall, xtea, etc.)
+  # Pattern: everything before "-totalrecall-" or "-xtea-" or similar method indicators
+  sample_part <- gsub("-(totalrecall|xtea|transurveyor)-.*$", "", te_id)
+  
+  return(sample_part)
+}
+
+# Helper function to extract base sample ID from sample names (keep for compatibility)
+extract_te_sample_id <- function(te_sample) {
+  # For samples like "0198", "3425", "3872", return as is
+  # For samples with suffixes like "0002_321321_T", extract the base ID "0002"
+  base_id <- gsub("_.*$", "", te_sample)  # Remove everything after first underscore
+  return(base_id)
+}
+
+# Wrapper function for systematic TE expression analysis with plotting
+run_systematic_te_expression_analysis <- function(rna_filtered, te_split_df, plot_dir, min_samples = 5, fdr_cutoff = 0.05, create_plots = TRUE, max_plots = 3, group_by_gene = FALSE, files_dir = NULL) {
+  cat("=== Systematic TE Expression Analysis ===\n")
+
+  # Check inputs
+  if (!is.data.frame(te_split_df)) {
+    cat("ERROR: te_split_df is not a data frame!\n")
+    cat("  Class:", class(te_split_df), "\n")
+    cat("  Type:", typeof(te_split_df), "\n")
+    return(data.frame())
+  }
+  if (!is.data.frame(rna_filtered)) {
+    cat("ERROR: rna_filtered is not a data frame!\n")
+    cat("  Class:", class(rna_filtered), "\n")
+    return(data.frame())
+  }
+
+  cat("Parameters:\n")
+  cat("  - Minimum samples per TE:", min_samples, "\n")
+  cat("  - FDR cutoff:", fdr_cutoff, "\n")
+  cat("  - Group by gene:", group_by_gene, "\n")
+  cat("  - RNA samples available:", ncol(rna_filtered) - 1, "\n")
+  cat("  - TE samples available:", length(unique(te_split_df$sample)), "\n")
+  cat("  - Genes in RNA data:", nrow(rna_filtered), "\n")
+  cat("\n")
+
+  systematic_results <- test_all_te_expression_effects(
+    rna_df = rna_filtered,
+    te_split_df = te_split_df,
+    min_samples = min_samples,
+    fdr_cutoff = fdr_cutoff,
+    group_by_gene = group_by_gene
+  )
+
+  if (nrow(systematic_results) > 0) {
+    # Determine output directory (use files_dir if provided, otherwise plot_dir)
+    output_dir <- ifelse(!is.null(files_dir), files_dir, plot_dir)
+
+    # Save complete results
+    mode_suffix <- ifelse(group_by_gene, "_by_gene", "_by_coordinates")
+    results_file <- paste0(output_dir, "rna_results_", min_samples, "samples", mode_suffix, ".csv")
+    write.csv(systematic_results, results_file, row.names=FALSE)
+    cat("Complete results (", nrow(systematic_results), "tests) saved to", basename(results_file), "\n")
+
+    # Display significant results
+    significant <- systematic_results[systematic_results$p_adj < fdr_cutoff, ]
+    if (nrow(significant) > 0) {
+      cat("Found", nrow(significant), "significant TE-gene expression associations at FDR <", fdr_cutoff, "!\n")
+
+      # Save significant results to separate file
+      sig_file <- paste0(output_dir, "significant_te_expression_results_", min_samples, "samples_fdr", fdr_cutoff, mode_suffix, ".csv")
+      write.csv(significant, sig_file, row.names=FALSE)
+      cat("Significant results saved to", basename(sig_file), "\n")
+      
+      # Print top 10 significant results
+      cat("\nTop", min(10, nrow(significant)), "significant TE-gene associations:\n")
+      for (i in 1:min(10, nrow(significant))) {
+        row <- significant[i, ]
+        if (group_by_gene) {
+          cat(sprintf("  %d. %s + %s: FC=%.2f, p_adj=%.2e (n_with=%d, n_without=%d)\n", 
+                      i, row$gene, row$te_type, row$fold_change, row$p_adj, 
+                      row$samples_with_te, row$samples_without_te))
+        } else {
+          cat(sprintf("  %d. %s (chr%d:%d-%d) → %s: FC=%.2f, p_adj=%.2e (n_with=%d, n_without=%d)\n", 
+                      i, row$te_type, row$te_chrom, row$te_start, row$te_end,
+                      row$gene, row$fold_change, row$p_adj, row$samples_with_te, row$samples_without_te))
+        }
+      }
+      
+      # Create plots for top significant results if requested
+      if (create_plots) {
+        cat("\nCreating plots for top", min(max_plots, nrow(significant)), "significant associations...\n")
+        for (i in 1:min(max_plots, nrow(significant))) {
+          result_row <- significant[i, ]
+          tryCatch({
+            cat("  Creating plot", i, "for", result_row$gene, "TE association...\n")
+            plot_result <- plot_gene_expression_te(
+              rna_df = rna_filtered,
+              te_split_df = te_split_df,
+              gene_of_interest = result_row$gene,
+              group_column = "TP53_status",
+              x_lab = "TE Status",
+              y_lab = paste(result_row$gene, "Expression (FPKM)"),
+              log_scale = FALSE,
+              te_based_grouping = TRUE
+            )
+            plot_title <- paste("Significant:", result_row$gene, "by TE presence")
+            titled_print(plot_result$plot, plot_title)
+            
+            plot_filename <- paste0(plot_dir, "significant_", result_row$gene, "_te_effect.png")
+            ggsave(plot_filename, plot=plot_result$plot, width=8, height=6)
+            cat("    Plot saved to", basename(plot_filename), "\n")
+          }, error = function(e) {
+            cat("    Error creating plot for", result_row$gene, ":", e$message, "\n")
+          })
+        }
+      }
+    } else {
+      cat("No significant TE-gene expression associations found at FDR <", fdr_cutoff, "\n")
+      cat("Summary of all results:\n")
+      if (nrow(systematic_results) > 0) {
+        cat("  - Total tests performed:", nrow(systematic_results), "\n")
+        cat("  - Minimum p-value:", min(systematic_results$p_value), "\n")
+        cat("  - Minimum adjusted p-value:", min(systematic_results$p_adj), "\n")
+        cat("  - Tests with p_adj < 0.1:", sum(systematic_results$p_adj < 0.1), "\n")
+        cat("  - Tests with p_adj < 0.2:", sum(systematic_results$p_adj < 0.2), "\n")
+      }
+    }
+  } else {
+    cat("No TE-gene pairs could be tested.\n")
+    cat("Possible reasons:\n")
+    cat("  - No TEs present in >=", min_samples, "samples\n")
+    cat("  - No overlap between RNA and TE samples\n")
+    cat("  - No genes affected by TEs found in RNA data\n")
+  }
+  
+  cat("\n")
+  return(systematic_results)
+}
+
+# Function to clean RNA samples for tumor data (keep RNA format)
+rename_rna_samples_kics_tumor <- function(kics_rna_data, matched_dna_rna_file = "/Users/briannelaverty/Documents/R_Malkin/te/data/rna/matched_dna_rna.csv") {
+  cat("Processing KICS tumor RNA samples using matched_dna_rna.csv...\n")
+  
+  # Load the DNA-RNA mapping file
+  dna_rna_mapping <- read.csv(matched_dna_rna_file, stringsAsFactors = FALSE)
+  cat("Loaded DNA-RNA mapping with", nrow(dna_rna_mapping), "entries\n")
+  
+  # Get current RNA sample names (excluding gene_name column)
+  rna_sample_names <- colnames(kics_rna_data)[-1]
+  
+  # Remove "X" prefix from RNA sample names if present (R adds this to numeric column names)
+  rna_sample_names_clean <- gsub("^X", "", rna_sample_names)
+  
+  # Create mapping dictionary: RNA name -> DNA name
+  mapping_dict <- setNames(dna_rna_mapping$sample_name_with_t, dna_rna_mapping$kics_rna_name)
+  
+  # Apply mapping to rename RNA samples to DNA sample names
+  new_names <- sapply(rna_sample_names_clean, function(rna_name) {
+    if (rna_name %in% names(mapping_dict)) {
+      return(mapping_dict[rna_name])
+    } else {
+      return(rna_name)  # Keep original if not found
+    }
+  })
+  
+  # Update column names with DNA names
+  colnames(kics_rna_data)[-1] <- new_names
+  
+  # Count successful mappings
+  mapped_count <- sum(new_names != rna_sample_names_clean)
+  
+  cat("KICS tumor RNA samples processed. Sample count:", length(new_names), "\n")
+  cat("Successfully mapped", mapped_count, "RNA samples to DNA names\n")
+  cat("Example mapped samples (first 5):", paste(head(new_names, 5), collapse=", "), "\n")
+  
+  return(kics_rna_data)
+}
+
+# Function to rename RNA samples to match TE sample IDs for germline data
+rename_rna_samples_kics_germline <- function(kics_rna_data, kics_dna2rna_mapping) {
+  cat("Renaming KICS germline RNA samples to match TE sample IDs...\n")
+  
+  # Create a reverse mapping from RNA name to FULL WGS sample name
+  reverse_mapping <- setNames(kics_dna2rna_mapping$sample, kics_dna2rna_mapping$rna_name)
+  
+  # Get current RNA sample names (excluding gene_name column)
+  rna_sample_names <- colnames(kics_rna_data)[-1]
+  
+  # Remove "X" prefix from RNA sample names if present
+  rna_sample_names_clean <- gsub("^X", "", rna_sample_names)
+  
+  # Apply the reverse mapping to get full sample names
+  new_names <- sapply(rna_sample_names_clean, function(rna_name) {
+    if (rna_name %in% names(reverse_mapping)) {
+      return(reverse_mapping[rna_name])
+    } else {
+      # If not found in mapping, keep the original cleaned name
+      return(rna_name)
+    }
+  })
+  
+  # Update column names with full sample names
+  colnames(kics_rna_data)[-1] <- new_names
+  
+  cat("KICS germline RNA samples renamed. Sample count:", length(new_names), "\n")
+  cat("Unique samples after renaming:", length(unique(new_names)), "\n")
+  cat("Example mappings (first 5):\n")
+  for (i in 1:min(5, length(rna_sample_names_clean))) {
+    cat("  ", rna_sample_names_clean[i], "->", new_names[i], "\n")
+  }
+  
+  return(kics_rna_data)
+}
+
+# Function to rename LFS RNA samples to match TE sample IDs  
+rename_rna_samples_lfs <- function(lfs_rna_data, lfs_wgs2rna_mapping) {
+  cat("Renaming LFS RNA samples to match TE sample IDs...\n")
+  
+  # Create mapping from RNA sample to WGS sample
+  mapping_dict <- setNames(lfs_wgs2rna_mapping$sample, lfs_wgs2rna_mapping$rna_sample)
+  
+  # Get current RNA sample names (excluding gene_name column)
+  rna_sample_names <- colnames(lfs_rna_data)[-1]
+  
+  # Apply mapping
+  new_names <- sapply(rna_sample_names, function(rna_name) {
+    if (rna_name %in% names(mapping_dict)) {
+      return(mapping_dict[rna_name])
+    } else {
+      return(rna_name)  # Keep original if not found
+    }
+  })
+  
+  # Update column names
+  colnames(lfs_rna_data)[-1] <- new_names
+  
+  cat("LFS RNA samples renamed. Sample count:", length(new_names), "\n")
+  return(lfs_rna_data)
+}
+
+# Function to rename St. Jude RNA samples (keep full sample names)
+rename_rna_samples_stjude <- function(stjude_rna_data) {
+  cat("Processing St. Jude RNA samples (removing duplicates)...\n")
+  
+  # Get St. Jude sample names
+  rna_sample_names <- colnames(stjude_rna_data)[-1]
+  
+  # Remove "X" prefix if R added it to numeric column names
+  clean_names <- gsub("^X", "", rna_sample_names)
+  
+  # Remove duplicate parts (e.g., SJACT071_SJACT071 -> SJACT071_T)
+  new_names <- sapply(clean_names, function(name) {
+    parts <- strsplit(name, "_")[[1]]
+    if (length(parts) >= 2 && parts[1] == parts[2]) {
+      # If first two parts are identical, use first part + _T
+      return(paste0(parts[1], "_T"))
+    } else {
+      return(name)  # Keep original if no duplicate pattern
+    }
+  })
+  
+  colnames(stjude_rna_data)[-1] <- new_names
+  
+  cat("St. Jude RNA samples processed. Sample count:", length(new_names), "\n")
+  cat("Example samples (first 5):", paste(head(new_names, 5), collapse=", "), "\n")
+  return(stjude_rna_data)
+}
+
+# Function to plot gene expression vs TE status
+plot_gene_expression_te <- function(rna_df, te_split_df, gene_of_interest, group_column,
+                                   x_lab, y_lab, log_scale = FALSE,
+                                   te_based_grouping = FALSE, combined_grouping = FALSE) {
+
+  # Validate inputs (duplicate function - add same checks)
+  if (!is.data.frame(te_split_df)) {
+    cat("ERROR in plot_gene_expression_te (v2): te_split_df is not a data frame!\n")
+    cat("  Class:", class(te_split_df), "\n")
+    cat("  Type:", typeof(te_split_df), "\n")
+    return(list(plot = NULL, merged_data = data.frame()))
+  }
+  if (!is.data.frame(rna_df)) {
+    cat("ERROR in plot_gene_expression_te (v2): rna_df is not a data frame!\n")
+    cat("  Class:", class(rna_df), "\n")
+    return(list(plot = NULL, merged_data = data.frame()))
+  }
+
+  # Filter for the gene of interest
+  if (!gene_of_interest %in% rna_df$gene_name) {
+    stop(paste("Gene", gene_of_interest, "not found in RNA data"))
+  }
+  
+  gene_expr <- rna_df[rna_df$gene_name == gene_of_interest, ]
+  
+  # Reshape to long format
+  expr_long <- gene_expr %>%
+    select(-gene_name) %>%
+    pivot_longer(everything(), names_to = "Sample", values_to = "Expression") %>%
+    filter(!is.na(Expression), Expression > 0)  # Remove missing/zero values
+  
+  cat("Gene expression data for", gene_of_interest, "- samples with data:", nrow(expr_long), "\n")
+  
+  if (te_based_grouping) {
+    # Use TE data for grouping
+    te_gene_data <- te_split_df %>%
+      filter(Gene_name == gene_of_interest) %>%
+      select(sample, any_of(group_column)) %>%
+      rename(Sample = sample)  # Rename to match RNA data format
+    
+    if (nrow(te_gene_data) == 0) {
+      cat("No TE data found for gene", gene_of_interest, ". Creating all samples as 'No TE'.\n")
+      # Create a dataframe with all RNA samples marked as "No TE"
+      te_gene_data <- expr_long %>%
+        select(Sample) %>%
+        distinct() %>%
+        mutate(TE_Status = "No TE")
+    } else {
+      te_gene_data <- te_gene_data %>%
+        mutate(TE_Status = "Has TE")
+      
+      # Add samples without TEs
+      samples_without_te <- expr_long %>%
+        filter(!Sample %in% te_gene_data$Sample) %>%
+        select(Sample) %>%
+        distinct() %>%
+        mutate(TE_Status = "No TE")
+      
+      # Add clinical data if available
+      if (group_column %in% colnames(te_gene_data)) {
+        samples_without_te[[group_column]] <- NA
+      }
+      
+      te_gene_data <- bind_rows(te_gene_data, samples_without_te)
+    }
+    
+    # Merge with expression data
+    plot_data <- expr_long %>%
+      left_join(te_gene_data, by = "Sample")
+    
+    # Set up grouping variable
+    if (combined_grouping && group_column %in% colnames(plot_data)) {
+      plot_data <- plot_data %>%
+        mutate(Group = paste(TE_Status, get(group_column), sep = " & "))
+      x_var <- "Group"
+    } else {
+      x_var <- "TE_Status"
+    }
+    
+  } else {
+    # Use clinical data for grouping
+    clinical_data <- te_split_df %>%
+      select(sample, any_of(group_column)) %>%
+      distinct() %>%
+      rename(Sample = sample)  # Rename to match RNA data format
+    
+    plot_data <- expr_long %>%
+      left_join(clinical_data, by = "Sample")
+    
+    x_var <- group_column
+  }
+  
+  # Apply log transformation if requested
+  if (log_scale) {
+    plot_data <- plot_data %>%
+      mutate(Expression = log2(Expression + 1))
+    y_lab <- paste("log2(", y_lab, " + 1)")
+  }
+  
+  # Create the plot
+  p <- ggplot(plot_data, aes_string(x = x_var, y = "Expression")) +
+    geom_boxplot() +
+    geom_jitter(width = 0.2, alpha = 0.6) +
+    labs(x = x_lab, y = y_lab, title = paste("Expression of", gene_of_interest)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Add statistical test if there are exactly 2 groups
+  if (length(unique(plot_data[[x_var]])) == 2) {
+    p <- p + geom_signif(comparisons = list(unique(plot_data[[x_var]])), 
+                        map_signif_level = TRUE, test = "wilcox.test")
+  }
+  
+  # Print summary statistics
+  summary_stats <- plot_data %>%
+    group_by(!!sym(x_var)) %>%
+    summarise(
+      n = n(),
+      median = median(Expression, na.rm = TRUE),
+      mean = mean(Expression, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  cat("Summary statistics for", gene_of_interest, "expression:\n")
+  print(summary_stats)
+  
+  return(list(plot = p, data = plot_data, summary = summary_stats))
+}
+
+validate_rna_mapping <- function(kics_rna, lfs_rna, kics_dna2rna, lfs_wgs2rna) {
+  cat("Checking KICS mapping file for RNA sample availability...\n")
+  
+  # Check KICS mapping entries that don't have corresponding RNA data
+  kics_rna_samples <- colnames(kics_rna)[-1]  # Exclude gene_name column
+  mapping_col <- NULL
+  if ("rna_name" %in% colnames(kics_dna2rna)) {
+    mapping_col <- "rna_name"
+  } else if ("rna" %in% colnames(kics_dna2rna)) {
+    mapping_col <- "rna"
+  }
+  
+  if (!is.null(mapping_col)) {
+    # Get valid RNA IDs from mapping file (remove NA and empty values)
+    valid_mapping_rows <- kics_dna2rna[!is.na(kics_dna2rna[[mapping_col]]) & kics_dna2rna[[mapping_col]] != "", ]
+    
+    if (nrow(valid_mapping_rows) > 0) {
+      # Check which mapping entries don't have corresponding RNA samples
+      unmatched_mapping_rows <- c()
+      for (i in 1:nrow(valid_mapping_rows)) {
+        rna_id <- valid_mapping_rows[[mapping_col]][i]
+        # Look for RNA sample ending with this RNA ID
+        matching_rna <- kics_rna_samples[grepl(paste0("_", rna_id, "$"), kics_rna_samples)]
+        if (length(matching_rna) == 0) {
+          unmatched_mapping_rows <- c(unmatched_mapping_rows, i)
+        }
+      }
+      
+      if (length(unmatched_mapping_rows) > 0) {
+        cat("KICS mapping rows without corresponding RNA samples:\n")
+        for (i in head(unmatched_mapping_rows, 10)) {
+          row <- valid_mapping_rows[i, ]
+          cat(sprintf("  Sample %s (DNA: %s, RNA: %s) - no RNA sample ending with _%s\n", 
+                      row$sample, row$dna, row[[mapping_col]], row[[mapping_col]]))
+        }
+        if (length(unmatched_mapping_rows) > 10) {
+          cat("  ... and", length(unmatched_mapping_rows) - 10, "more mapping rows\n")
+        }
+      } else {
+        cat("All KICS mapping entries have corresponding RNA samples.\n")
+      }
+      
+      cat("KICS mapping summary:", nrow(valid_mapping_rows), "total entries,", 
+          length(unmatched_mapping_rows), "without RNA matches\n")
+    } else {
+      cat("No valid KICS mapping entries found.\n")
+    }
+  } else {
+    cat("Warning: Neither 'rna_name' nor 'rna' column found in kics_dna2rna mapping file.\n")
+    cat("Available columns:", paste(colnames(kics_dna2rna), collapse=", "), "\n")
+  }
+  
+  # LFS and St. Jude have separate processing - just note they're handled differently
+  cat("LFS and St. Jude samples processed separately with their own mapping logic.\n")
+  
+  invisible(NULL)
+}
+
+# ====== TUMOR RNA PROCESSING FUNCTIONS ======
+
+#' Create unified RNA dataframe structure - only include samples with actual RNA data
+#' @param rna_df Input RNA dataframe
+#' @param all_samples Vector of all sample names (UNUSED - kept for compatibility)
+#' @return RNA dataframe with only actual RNA samples (no zero-filled columns)
+create_unified_rna <- function(rna_df, all_samples = NULL) {
+  # Only return columns that actually exist (no zero-filled columns)
+  # Keep gene_name, all existing sample columns, and dataset
+  existing_sample_cols <- setdiff(colnames(rna_df), c("gene_name", "dataset"))
+  rna_df <- rna_df[, c("gene_name", existing_sample_cols, "dataset")]
+  return(rna_df)
+}
+
+#' Process and combine tumor RNA datasets
+#' @param kics_rna KICS RNA FPKM data
+#' @param lfs_rna LFS RNA FPKM data  
+#' @param stjude_rna St. Jude RNA FPKM data
+#' @param lfs_wgs2rna LFS WGS to RNA mapping file
+#' @return List with combined RNA data and sample information
+process_tumor_rna_data <- function(kics_rna, lfs_rna, stjude_rna, lfs_wgs2rna) {
+  cat("Processing tumor RNA data with corrected sample matching...\n")
+  
+  # Validate RNA mapping before processing (KICS now uses matched_dna_rna.csv)
+  cat("KICS RNA processing now uses matched_dna_rna.csv for direct DNA-RNA mapping.\n")
+  
+  # Rename RNA samples to match TE sample IDs (using matched_dna_rna.csv)
+  kics_rna_renamed <- rename_rna_samples_kics_tumor(kics_rna)
+  lfs_rna_renamed <- rename_rna_samples_lfs(lfs_rna, lfs_wgs2rna)
+  stjude_rna_renamed <- rename_rna_samples_stjude(stjude_rna)
+  
+  # Add dataset identifiers
+  kics_rna_renamed$dataset <- "KICS"
+  lfs_rna_renamed$dataset <- "LFS"
+  stjude_rna_renamed$dataset <- "StJude"
+  
+  # Find common genes across all datasets
+  common_genes <- intersect(intersect(kics_rna_renamed$gene_name, lfs_rna_renamed$gene_name), stjude_rna_renamed$gene_name)
+  cat("Common genes across all RNA datasets:", length(common_genes), "\n")
+  
+  # Filter datasets to common genes and combine
+  kics_common <- kics_rna_renamed[kics_rna_renamed$gene_name %in% common_genes, ]
+  lfs_common <- lfs_rna_renamed[lfs_rna_renamed$gene_name %in% common_genes, ]
+  stjude_common <- stjude_rna_renamed[stjude_rna_renamed$gene_name %in% common_genes, ]
+  
+  # No need for unified structure - just combine datasets as-is
+  # Remove dataset column for binding and keep only actual samples
+  kics_clean <- kics_common %>% select(-dataset)
+  lfs_clean <- lfs_common %>% select(-dataset)
+  stjude_clean <- stjude_common %>% select(-dataset)
+  
+  # Combine datasets - dplyr will handle mismatched columns automatically
+  rna_combined <- bind_rows(kics_clean, lfs_clean, stjude_clean, .id = "source")
+  
+  # Aggregate by gene (sum expression values across datasets)
+  # Get all sample columns (excluding gene_name and source)
+  sample_cols <- setdiff(colnames(rna_combined), c("gene_name", "source"))
+  
+  rna_aggregated <- rna_combined %>%
+    select(-source) %>%
+    group_by(gene_name) %>%
+    summarise(across(all_of(sample_cols), \(x) sum(x, na.rm = TRUE)), .groups = 'drop')
+  
+  # Filter for genes with reasonable expression (remove all-zero genes)
+  genes_with_expression <- rna_aggregated %>%
+    filter(if_any(-gene_name, ~ .x > 0))
+  
+  cat("Genes with expression data:", nrow(genes_with_expression), "\n")
+  
+  # Get final sample list from actual data
+  final_samples <- setdiff(colnames(genes_with_expression), "gene_name")
+  
+  return(list(
+    rna_data = genes_with_expression,
+    all_samples = final_samples,
+    common_genes = common_genes
+  ))
+}
+
+#' Process germline RNA data - combine KICS, LFS, and St. Jude datasets
+#' @param kics_rna KICS RNA expression data
+#' @param lfs_rna LFS RNA expression data
+#' @param stjude_rna St. Jude RNA expression data
+#' @param matched_dna_rna DNA-RNA mapping file
+#' @param lfs_wgs2rna LFS WGS-RNA mapping file
+#' @return List with combined RNA data and metadata
+process_germline_rna_data <- function(kics_rna, lfs_rna, stjude_rna, matched_dna_rna, lfs_wgs2rna) {
+  # Rename RNA samples to match TE sample IDs (same as tumor)
+  kics_rna_renamed <- rename_rna_samples_kics_tumor(kics_rna)
+  lfs_rna_renamed <- rename_rna_samples_lfs(lfs_rna, lfs_wgs2rna)
+  stjude_rna_renamed <- rename_rna_samples_stjude(stjude_rna)
+
+  # Find common genes across all datasets
+  common_genes <- intersect(intersect(kics_rna_renamed$gene_name, lfs_rna_renamed$gene_name), stjude_rna_renamed$gene_name)
+
+  # Filter datasets to common genes
+  kics_common <- kics_rna_renamed[kics_rna_renamed$gene_name %in% common_genes, ]
+  lfs_common <- lfs_rna_renamed[lfs_rna_renamed$gene_name %in% common_genes, ]
+  stjude_common <- stjude_rna_renamed[stjude_rna_renamed$gene_name %in% common_genes, ]
+
+  # Combine datasets
+  rna_combined <- bind_rows(kics_common, lfs_common, stjude_common, .id = "source")
+
+  # Aggregate by gene (sum expression values across datasets)
+  sample_cols <- setdiff(colnames(rna_combined), c("gene_name", "source"))
+
+  rna_aggregated <- rna_combined %>%
+    select(-source) %>%
+    group_by(gene_name) %>%
+    summarise(across(all_of(sample_cols), \(x) sum(x, na.rm = TRUE)), .groups = 'drop')
+
+  # Filter for genes with expression (remove all-zero genes)
+  genes_with_expression <- rna_aggregated %>%
+    filter(if_any(-gene_name, ~ .x > 0))
+
+  # Get final sample list
+  final_samples <- setdiff(colnames(genes_with_expression), "gene_name")
+
+  return(list(
+    rna_data = genes_with_expression,
+    all_samples = final_samples,
+    common_genes = common_genes
+  ))
+}
+
+#' Match germline TE samples with RNA samples and create filtered dataset
+#' @param rna_ready_for_filtering Prepared RNA data ready for TE matching
+#' @param te_aff_split Germline TE split data with sample information
+#' @param r_dir_files Output directory for CSV files (optional)
+#' @return List with filtered RNA data and matching statistics
+match_te_rna_samples_germline <- function(rna_ready_for_filtering, te_aff_split, r_dir_files = NULL) {
+  cat("\n=== MATCHING RNA AND TE SAMPLES (GERMLINE) ===\n")
+
+  # Get unique TE samples
+  te_samples <- unique(te_aff_split$sample)
+  cat("Total unique TE samples:", length(te_samples), "\n")
+
+  # Get RNA sample IDs (already renamed to match TE IDs)
+  rna_samples_available <- colnames(rna_ready_for_filtering)[-1]  # Exclude gene_name
+  cat("Total RNA samples available:", length(rna_samples_available), "\n")
+
+  # Step 1: Direct full ID matching
+  matched_rna_samples <- intersect(te_samples, rna_samples_available)
+  cat("Direct matches:", length(matched_rna_samples), "\n")
+
+  # Step 2: Base ID matching for unmatched TE patients
+  remaining_rna_samples <- setdiff(rna_samples_available, matched_rna_samples)
+
+  te_base_ids <- unique(sub("_.*", "", te_samples))
+  matched_base_ids <- unique(sub("_.*", "", matched_rna_samples))
+  unmatched_te_base_ids <- setdiff(te_base_ids, matched_base_ids)
+
+  cat("TE patients without direct RNA matches:", length(unmatched_te_base_ids), "\n")
+
+  if (length(unmatched_te_base_ids) > 0 && length(remaining_rna_samples) > 0) {
+    rna_base_ids <- sub("_.*", "", remaining_rna_samples)
+    matching_base_ids <- intersect(rna_base_ids, unmatched_te_base_ids)
+    base_matched_rna <- remaining_rna_samples[rna_base_ids %in% matching_base_ids]
+
+    matched_rna_samples <- c(matched_rna_samples, base_matched_rna)
+    cat("Additional base ID matches:", length(base_matched_rna), "\n")
+  }
+
+  cat("Total matched RNA samples:", length(matched_rna_samples), "\n")
+  cat("  From", length(unique(sub("_.*", "", matched_rna_samples))), "unique patients\n")
+
+  # Filter RNA data to matched samples only
+  rna_filtered <- rna_ready_for_filtering %>%
+    select(gene_name, all_of(matched_rna_samples))
+
+  # Report unmatched samples
+  unmatched_te <- setdiff(te_samples, matched_rna_samples)
+  unmatched_rna <- setdiff(rna_samples_available, matched_rna_samples)
+
+  if (length(unmatched_te) > 0) {
+    cat("TE samples without RNA:", length(unmatched_te), "\n")
+    cat("  First few:", paste(head(unmatched_te, 5), collapse=", "), "\n")
+  }
+  if (length(unmatched_rna) > 0) {
+    cat("RNA samples without TE:", length(unmatched_rna), "\n")
+    cat("  First few:", paste(head(unmatched_rna, 5), collapse=", "), "\n")
+  }
+
+  cat("\nFinal RNA dataset:", nrow(rna_filtered), "genes x", ncol(rna_filtered)-1, "samples\n")
+
+  # Export matched/unmatched samples to CSV if directory provided
+  if (!is.null(r_dir_files)) {
+    # Export matched samples
+    if (length(matched_rna_samples) > 0) {
+      matched_df <- data.frame(
+        sample_id = matched_rna_samples,
+        status = "Matched (TE + RNA)",
+        stringsAsFactors = FALSE
+      )
+      write.csv(matched_df, paste0(r_dir_files, "matched_samples_germline.csv"), row.names = FALSE)
+    }
+
+    # Export unmatched TE samples
+    if (length(unmatched_te) > 0) {
+      unmatched_te_df <- data.frame(
+        sample_id = unmatched_te,
+        status = "TE only (no RNA)",
+        stringsAsFactors = FALSE
+      )
+      write.csv(unmatched_te_df, paste0(r_dir_files, "unmatched_te_samples_germline.csv"), row.names = FALSE)
+    }
+
+    # Export unmatched RNA samples
+    if (length(unmatched_rna) > 0) {
+      unmatched_rna_df <- data.frame(
+        sample_id = unmatched_rna,
+        status = "RNA only (no TE)",
+        stringsAsFactors = FALSE
+      )
+      write.csv(unmatched_rna_df, paste0(r_dir_files, "unmatched_rna_samples_germline.csv"), row.names = FALSE)
+    }
+
+    cat("\nMatching results exported to:", r_dir_files, "\n")
+  }
+
+  return(list(
+    rna_filtered = rna_filtered
+  ))
+}
+
+#' Match TE samples with RNA samples and create filtered dataset (using matched_dna_rna.csv)
+#' @param rna_ready_for_filtering Prepared RNA data ready for TE matching
+#' @param te_all_t TE data with sample information  
+#' @param matched_dna_rna_file Path to matched_dna_rna.csv file (used if dna_rna_mapping not provided)
+#' @param r_dir_files Output directory for CSV files
+#' @param dna_rna_mapping Pre-loaded DNA-RNA mapping dataframe (optional)
+#' @return List with filtered RNA data and matching statistics
+match_te_rna_samples <- function(rna_ready_for_filtering, te_all_t, matched_dna_rna_file = "/Users/briannelaverty/Documents/R_Malkin/te/data/rna/matched_dna_rna.csv", r_dir_files, dna_rna_mapping = NULL, original_kics_rna = NULL, te_all_all_t = NULL) {
+  cat("Completing tumor RNA data filtering with TE sample overlap...\n")
+  
+  # Get primary TE sample names (selected samples - use full ID matching)
+  te_primary_samples <- unique(te_all_t$sample)
+  cat("Primary TE sample names from te_all_t (first 10):", paste(head(te_primary_samples, 10), collapse=", "), "\n")
+  
+  # Get extended TE sample names for fallback matching
+  te_extended_samples <- if (!is.null(te_all_all_t)) unique(te_all_all_t$sample) else c()
+  if (!is.null(te_all_all_t)) {
+    cat("Extended TE sample names from te_all_all_t (first 10):", paste(head(te_extended_samples, 10), collapse=", "), "\n")
+  }
+  
+  # Load matched DNA-RNA mapping (use pre-loaded if available)
+  if (is.null(dna_rna_mapping)) {
+    dna_rna_mapping <- read.csv(matched_dna_rna_file, stringsAsFactors = FALSE)
+    cat("Loaded DNA-RNA mapping from file:", matched_dna_rna_file, "\n")
+  } else {
+    cat("Using pre-loaded DNA-RNA mapping data\n")
+  }
+  
+  # Get available RNA samples (now they should have DNA names)
+  rna_samples_available <- colnames(rna_ready_for_filtering)[-1]  # Exclude gene_name
+  
+  # Step 1: Direct full ID matching with te_all_t (selected samples)
+  matched_rna_samples <- intersect(te_primary_samples, rna_samples_available)
+  cat("Direct matches with te_all_t:", length(matched_rna_samples), "\n")
+  
+  # Step 2: Base ID matching for patients in te_all_t that didn't get direct matches
+  if (!is.null(te_all_all_t)) {
+    remaining_rna_samples <- setdiff(rna_samples_available, matched_rna_samples)
+    
+    # Only consider base IDs from patients in te_all_t (selected samples)
+    te_primary_base_ids <- unique(sub("_.*", "", te_primary_samples))
+    matched_base_ids <- unique(sub("_.*", "", matched_rna_samples))
+    unmatched_te_base_ids <- setdiff(te_primary_base_ids, matched_base_ids)
+    
+    cat("TE patients without direct RNA matches:", length(unmatched_te_base_ids), "\n")
+    
+    if (length(unmatched_te_base_ids) > 0) {
+      # Extract base IDs for remaining RNA samples
+      rna_base_ids <- sub("_.*", "", remaining_rna_samples)
+      
+      # Only match base IDs from unmatched TE patients
+      matching_base_ids <- intersect(rna_base_ids, unmatched_te_base_ids)
+      base_matched_rna <- remaining_rna_samples[rna_base_ids %in% matching_base_ids]
+      
+      # Add base ID matches to final list
+      matched_rna_samples <- c(matched_rna_samples, base_matched_rna)
+      cat("Additional base ID matches for unmatched TE patients:", length(base_matched_rna), "\n")
+    }
+  }
+  
+  # Special case: Force match for specific LFS samples with same base sample
+  special_lfs_samples <- c("5009_4_T", "2921_5_T")
+  for (lfs_sample in special_lfs_samples) {
+    if (lfs_sample %in% rna_samples_available && !lfs_sample %in% matched_rna_samples) {
+      # Extract base sample (e.g., "5009" from "5009_4_T")
+      base_sample <- gsub("_.*$", "", lfs_sample)
+      # Find any TE sample with same base sample from either dataset
+      all_te_samples <- c(te_primary_samples, te_extended_samples)
+      matching_te_samples <- all_te_samples[grepl(paste0("^", base_sample, "_"), all_te_samples)]
+      if (length(matching_te_samples) > 0) {
+        # Force this RNA sample to be considered "matched"
+        matched_rna_samples <- c(matched_rna_samples, lfs_sample)
+        cat(sprintf("Special case: Matched %s to TE samples with base %s\n", lfs_sample, base_sample))
+      }
+    }
+  }
+  
+  cat("Total TE samples processed:", length(c(te_primary_samples, te_extended_samples)), "\n")
+  cat("Available RNA samples:", length(rna_samples_available), "\n") 
+  cat("Matched RNA samples:", length(matched_rna_samples), "\n")
+  
+  # Show matching details for primary TE samples
+  for (te_sample in head(te_primary_samples, 10)) {
+    if (te_sample %in% matched_rna_samples) {
+      cat("✓ TE sample", te_sample, "-> direct match with RNA sample\n")
+    } else {
+      cat("✗ TE sample", te_sample, "-> no RNA sample match\n")
+    }
+  }
+  if (length(te_primary_samples) > 10) {
+    cat("... and", length(te_primary_samples) - 10, "more TE samples\n")
+  }
+  
+  # Generate unmatched TE samples report  
+  unmatched_te_samples <- setdiff(te_primary_samples, matched_rna_samples)
+  
+  # Get original RNA sample names for filtering stale mappings
+  original_rna_samples <- NULL
+  if (!is.null(original_kics_rna)) {
+    original_rna_samples <- colnames(original_kics_rna)[-1]  # Exclude gene_name
+  }
+  
+  unmatched_te_results <- export_unmatched_te_samples_new(unmatched_te_samples, dna_rna_mapping, r_dir_files, original_rna_samples)
+  
+  # Generate unmatched RNA samples report
+  te_dataset_for_rna_filtering <- if (!is.null(te_all_all_t)) te_all_all_t else te_all_t
+  unmatched_rna_samples <- setdiff(rna_samples_available, matched_rna_samples)
+  unmatched_rna_results <- export_unmatched_rna_samples_new(unmatched_rna_samples, dna_rna_mapping, r_dir_files, original_kics_rna, te_dataset_for_rna_filtering, matched_rna_samples)
+  
+  # Export successful matches to CSV
+  if (length(matched_rna_samples) > 0) {
+    matched_samples_df <- data.frame(
+      sample_name = matched_rna_samples,
+      status = "Successfully matched TE and RNA data",
+      stringsAsFactors = FALSE
+    )
+    write.csv(matched_samples_df, paste0(r_dir_files, "successfully_matched_samples.csv"), row.names = FALSE)
+
+    # Print summary
+    cat("\n=== FINAL MATCHING SUMMARY ===\n")
+    cat(sprintf("✓ %d samples successfully matched (TE + RNA)\n", length(matched_rna_samples)))
+    cat(sprintf("  - From %d unique patients\n", length(unique(gsub("_.*", "", matched_rna_samples)))))
+    if (unmatched_te_results$unmatched_count > 0) {
+      cat(sprintf("⚠ %d TE samples without RNA (see unmatched_te_samples_new.csv)\n", unmatched_te_results$unmatched_count))
+    }
+    if (unmatched_rna_results$unmatched_count > 0) {
+      cat(sprintf("⚠ %d RNA samples without TE (see unmatched_rna_samples_new.csv)\n", unmatched_rna_results$unmatched_count))
+    }
+    cat(sprintf("\nDetails saved to: successfully_matched_samples.csv\n"))
+  }
+  
+  # Apply same sample selection logic as TE data (one sample per patient)
+  if (length(matched_rna_samples) > 0) {
+    # Load clinical data to get patient info for sample selection
+    if (!is.null(te_all_t)) {
+      # Create a sample-to-patient mapping from TE data
+      te_clinical_info <- te_all_t %>%
+        select(sample, base_sample, age_at_enrollment, lesion_type, disease_state) %>%
+        distinct()
+      
+      # Filter to only matched RNA samples that have clinical info
+      rna_samples_with_clinical <- matched_rna_samples[matched_rna_samples %in% te_clinical_info$sample]
+      
+      if (length(rna_samples_with_clinical) > 0) {
+        # Apply sample selection logic (same as TE data)
+        selected_rna_samples_df <- te_clinical_info %>%
+          filter(sample %in% rna_samples_with_clinical) %>%
+          group_by(base_sample) %>%
+          arrange(age_at_enrollment, 
+                  ifelse(lesion_type == "primary", 1, 
+                         ifelse(lesion_type %in% c("metastasis", "relapse"), 2, 3)),
+                  ifelse(disease_state == "initial", 1,
+                         ifelse(disease_state == "progressive", 2,
+                                ifelse(disease_state %in% c("relapsed", "relapse"), 3, 4)))) %>%
+          slice(1) %>%
+          ungroup()
+        
+        selected_rna_samples <- selected_rna_samples_df$sample
+        cat("Applied sample selection: ", length(rna_samples_with_clinical), "->", length(selected_rna_samples), "samples (one per patient)\n")
+      } else {
+        selected_rna_samples <- matched_rna_samples
+        cat("No clinical info available for sample selection, using all matched samples\n")
+      }
+    } else {
+      selected_rna_samples <- matched_rna_samples
+      cat("No TE data available for sample selection, using all matched samples\n")
+    }
+    
+    rna_filtered <- rna_ready_for_filtering %>%
+      select(gene_name, all_of(selected_rna_samples))
+    
+    cat("Final selected RNA samples (first 10):", paste(head(selected_rna_samples, 10), collapse=", "), "\n")
+  } else {
+    # Fallback to no filtering if no matches found
+    rna_filtered <- rna_ready_for_filtering
+    cat("Warning: No RNA-TE sample matches found. Using all RNA data.\n")
+  }
+  
+  # Check final results
+  rna_samples_final <- colnames(rna_filtered)[-1]  # Exclude gene_name
+  cat("Final tumor RNA dataset dimensions:", nrow(rna_filtered), "genes x", length(rna_samples_final), "samples\n")
+  
+  return(list(
+    rna_filtered = rna_filtered,
+    sample_overlap = matched_rna_samples,
+    matched_samples = length(matched_rna_samples),
+    total_te_samples = length(te_primary_samples),
+    unmatched_te_info = unmatched_te_results,
+    unmatched_rna_info = unmatched_rna_results
+  ))
+}
+
+#' Export unmatched WGS to RNA mapping rows to CSV
+#' @param te_sample_names Vector of TE sample names
+#' @param rna_ready_for_filtering RNA data ready for filtering
+#' @param kics_dna2rna KICS WGS to RNA mapping file
+#' @param r_dir_files Output directory for CSV files
+#' @return List with unmatched sample information
+export_unmatched_wgs2rna_rows <- function(te_sample_names, rna_ready_for_filtering, kics_dna2rna, r_dir_files) {
+  # Find unmatched TE samples
+  unmatched_te_samples <- c()
+  for (te_sample in te_sample_names) {
+    mapping_row <- kics_dna2rna[kics_dna2rna$sample == te_sample, ]
+    if (nrow(mapping_row) > 0 && !is.na(mapping_row$rna[1])) {
+      rna_id <- mapping_row$rna[1]
+      rna_samples_available <- colnames(rna_ready_for_filtering)[-1]
+      matching_rna <- rna_samples_available[grepl(paste0("_", rna_id, "$"), rna_samples_available)]
+      if (length(matching_rna) == 0) {
+        unmatched_te_samples <- c(unmatched_te_samples, te_sample)
+      }
+    }
+  }
+  
+  if (length(unmatched_te_samples) > 0) {
+    cat("\nkics_wgs2rna_tumour rows that don't have matching RNA samples:\n")
+    cat("Format: sample | dna | rna | (reason)\n")
+    
+    # Create dataframe for unmatched rows
+    unmatched_rows <- data.frame()
+    
+    for (te_sample in head(unmatched_te_samples, 20)) {
+      mapping_row <- kics_dna2rna[kics_dna2rna$sample == te_sample, ]
+      if (nrow(mapping_row) > 0) {
+        cat(sprintf("  %s | %s | %s | (RNA sample ending with %s not found)\n", 
+                    mapping_row$sample[1], mapping_row$dna[1], mapping_row$rna[1], mapping_row$rna[1]))
+      }
+    }
+    
+    if (length(unmatched_te_samples) > 20) {
+      cat("  ... and", length(unmatched_te_samples) - 20, "more unmapped rows\n")
+    }
+    
+    # Create complete unmatched rows dataframe for CSV export
+    for (te_sample in unmatched_te_samples) {
+      mapping_row <- kics_dna2rna[kics_dna2rna$sample == te_sample, ]
+      if (nrow(mapping_row) > 0) {
+        unmatched_rows <- rbind(unmatched_rows, data.frame(
+          sample = mapping_row$sample[1],
+          dna = mapping_row$dna[1], 
+          rna = mapping_row$rna[1],
+          reason = paste("RNA sample ending with", mapping_row$rna[1], "not found"),
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+    
+    # Export unmatched rows to CSV
+    write.csv(unmatched_rows, paste0(r_dir_files, "unmatched_wgs2rna_rows.csv"), row.names = FALSE)
+    cat("Unmatched rows exported to:", paste0(r_dir_files, "unmatched_wgs2rna_rows.csv"), "\n")
+    
+    return(list(
+      unmatched_count = length(unmatched_te_samples),
+      unmatched_rows = unmatched_rows
+    ))
+  } else {
+    cat("\nAll TE samples have matching RNA samples.\n")
+    return(list(unmatched_count = 0, unmatched_rows = data.frame()))
+  }
+}
+
+#' Export unmatched TE samples using new matched_dna_rna.csv approach
+#' @param unmatched_te_samples Vector of TE sample names that don't have RNA matches
+#' @param dna_rna_mapping DNA-RNA mapping dataframe
+#' @param r_dir_files Output directory for CSV files
+#' @return List with unmatched sample information
+export_unmatched_te_samples_new <- function(unmatched_te_samples, dna_rna_mapping, r_dir_files, rna_samples_available = NULL) {
+  if (length(unmatched_te_samples) > 0) {
+    # Filter to only include samples that have mappings but missing RNA data
+    samples_with_mapping <- unmatched_te_samples[unmatched_te_samples %in% dna_rna_mapping$sample_name_with_t]
+    samples_without_mapping <- length(unmatched_te_samples) - length(samples_with_mapping)
+
+    cat("\n=== TE-RNA MATCHING SUMMARY ===\n")
+
+    # Create dataframe for unmatched TE samples (only those with mappings)
+    unmatched_rows <- data.frame()
+
+    if (length(samples_with_mapping) > 0) {
+      cat(sprintf("⚠ %d TE samples expected RNA but none found:\n", length(samples_with_mapping)))
+      for (te_sample in head(samples_with_mapping, 5)) {
+        # Get mapping row (we know it exists)
+        mapping_row <- dna_rna_mapping[dna_rna_mapping$sample_name_with_t == te_sample, ]
+
+        cat(sprintf("  • %s (expected RNA: %s)\n",
+                    te_sample, mapping_row$kics_rna_name[1]))
+        reason <- "RNA sample processed but not available in expression data"
+
+        unmatched_rows <- rbind(unmatched_rows, data.frame(
+          te_sample = te_sample,
+          dna_name = te_sample,
+          rna_name = mapping_row$kics_rna_name[1],
+          reason = reason,
+          stringsAsFactors = FALSE
+        ))
+      }
+
+      if (length(samples_with_mapping) > 5) {
+        cat(sprintf("  ... and %d more (see CSV file)\n", length(samples_with_mapping) - 5))
+      }
+    } else {
+      cat("✓ All TE samples with RNA mappings have RNA data\n")
+    }
+
+    # Report samples without mapping (but don't include in unmatched list)
+    if (samples_without_mapping > 0) {
+      cat(sprintf("✓ %d TE samples are DNA-only (no RNA expected)\n", samples_without_mapping))
+    }
+    
+    # Create complete unmatched dataframe for remaining samples with mappings
+    if (length(samples_with_mapping) > 5) {
+      for (te_sample in tail(samples_with_mapping, -5)) {
+        mapping_row <- dna_rna_mapping[dna_rna_mapping$sample_name_with_t == te_sample, ]
+        reason <- "RNA sample processed but not available in expression data"
+
+        unmatched_rows <- rbind(unmatched_rows, data.frame(
+          te_sample = te_sample,
+          dna_name = te_sample,
+          rna_name = mapping_row$kics_rna_name[1],
+          reason = reason,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+
+    # Export unmatched rows to CSV
+    if (nrow(unmatched_rows) > 0) {
+      write.csv(unmatched_rows, paste0(r_dir_files, "unmatched_te_samples_new.csv"), row.names = FALSE)
+      cat(sprintf("\nDetails saved to: unmatched_te_samples_new.csv\n"))
+    }
+    
+    return(list(
+      unmatched_count = length(unmatched_te_samples),
+      unmatched_rows = unmatched_rows
+    ))
+  } else {
+    cat("\nAll TE samples have matching RNA samples.\n")
+    return(list(unmatched_count = 0, unmatched_rows = data.frame()))
+  }
+}
+
+#' Export RNA samples that don't have corresponding TE/DNA data
+#' @param unmatched_rna_samples Vector of RNA sample names that don't have TE matches
+#' @param dna_rna_mapping DNA-RNA mapping dataframe
+#' @param r_dir_files Output directory for CSV files
+#' @return List with unmatched RNA sample information
+export_unmatched_rna_samples_new <- function(unmatched_rna_samples, dna_rna_mapping, r_dir_files, original_kics_rna = NULL, te_all_t = NULL, matched_rna_samples = NULL) {
+  if (length(unmatched_rna_samples) > 0) {
+    # Get base samples that already have matched RNA
+    matched_base_samples <- c()
+    if (!is.null(matched_rna_samples)) {
+      matched_base_samples <- unique(gsub("_.*$", "", matched_rna_samples))
+    }
+
+    # Filter to only include RNA samples where NO RNA from that base sample matched to te_all_t
+    filtered_rna_samples <- unmatched_rna_samples
+    if (!is.null(te_all_t)) {
+      # Get TE sample names
+      te_sample_names <- unique(te_all_t$sample)
+
+      # Extract base sample IDs from TE samples
+      te_base_samples <- unique(gsub("_.*$", "", te_sample_names))
+
+      # Filter unmatched RNA samples:
+      # 1. Base sample must exist in TE data
+      # 2. Base sample must NOT have any RNA already matched
+      filtered_rna_samples <- c()
+      for (rna_sample in unmatched_rna_samples) {
+        base_sample <- gsub("_.*$", "", rna_sample)  # Extract base sample ID
+        if (base_sample %in% te_base_samples && !base_sample %in% matched_base_samples) {
+          filtered_rna_samples <- c(filtered_rna_samples, rna_sample)
+        }
+      }
+
+    }
+
+    if (length(filtered_rna_samples) > 0) {
+      cat(sprintf("\n⚠ %d RNA samples (from %d patients) have no matching TE data:\n",
+                  length(filtered_rna_samples), length(unique(gsub("_.*", "", filtered_rna_samples)))))
+
+      # Create dataframe for unmatched RNA samples
+      unmatched_rna_rows <- data.frame()
+
+      for (rna_sample in head(filtered_rna_samples, 5)) {
+      # Check if RNA sample is a DNA-format name that should have a reverse mapping
+      mapping_row <- dna_rna_mapping[dna_rna_mapping$sample_name_with_t == rna_sample, ]
+
+      if (nrow(mapping_row) > 0) {
+        # This RNA sample has a mapping but no TE data
+        cat(sprintf("  • %s (original: %s)\n",
+                    rna_sample, mapping_row$kics_rna_name[1]))
+        reason <- "Mapped TE sample not found"
+        original_rna_name <- mapping_row$kics_rna_name[1]
+      } else {
+        # Check if this might be an LFS or St. Jude sample (different naming scheme)
+        cat(sprintf("  • %s (LFS/StJude)\n", rna_sample))
+        reason <- "RNA sample not in mapping file"
+        original_rna_name <- rna_sample
+      }
+
+      unmatched_rna_rows <- rbind(unmatched_rna_rows, data.frame(
+        rna_sample = rna_sample,
+        original_rna_name = original_rna_name,
+        reason = reason,
+        stringsAsFactors = FALSE
+      ))
+    }
+
+      if (length(filtered_rna_samples) > 5) {
+        cat(sprintf("  ... and %d more (see CSV file)\n", length(filtered_rna_samples) - 5))
+      }
+
+      # Create complete unmatched dataframe for remaining RNA samples
+      if (length(filtered_rna_samples) > 5) {
+        for (rna_sample in tail(filtered_rna_samples, -5)) {
+        mapping_row <- dna_rna_mapping[dna_rna_mapping$sample_name_with_t == rna_sample, ]
+
+        if (nrow(mapping_row) > 0) {
+          reason <- "Mapped TE sample not found"
+          original_rna_name <- mapping_row$kics_rna_name[1]
+        } else {
+          reason <- "RNA sample not in mapping file"
+          original_rna_name <- rna_sample
+        }
+
+        unmatched_rna_rows <- rbind(unmatched_rna_rows, data.frame(
+          rna_sample = rna_sample,
+          original_rna_name = original_rna_name,
+          reason = reason,
+          stringsAsFactors = FALSE
+        ))
+      }
+    }
+
+      # Export unmatched RNA rows to CSV
+      write.csv(unmatched_rna_rows, paste0(r_dir_files, "unmatched_rna_samples_new.csv"), row.names = FALSE)
+      cat(sprintf("\nDetails saved to: unmatched_rna_samples_new.csv\n"))
+
+      return(list(
+        unmatched_count = length(filtered_rna_samples),
+        unmatched_rows = unmatched_rna_rows
+      ))
+    } else {
+      cat("\n✓ All patients with TE data have matched RNA samples\n")
+      return(list(unmatched_count = 0, unmatched_rows = data.frame()))
+    }
+  } else {
+    cat("\n✓ All RNA samples have corresponding TE data\n")
+    return(list(unmatched_count = 0, unmatched_rows = data.frame()))
+  }
+}
+
+# Prepare survival data for Kaplan-Meier analysis
+# Merges TE burden data with survival outcomes and creates survival time/event variables
+prepare_survival_data <- function(te_data, dod_data) {
+  # Prepare TE data with base sample (extract everything before first underscore)
+  te_survival <- te_data %>%
+    mutate(base_sample = sub("_.*", "", sample))
+
+  # Clean DOD data - pad KiCS ID with leading zeros to 4 digits (e.g., 2 -> "0002")
+  kics_DOD_clean <- dod_data %>%
+    rename(kics_id = `KiCS ID`) %>%
+    mutate(base_sample = sprintf("%04d", kics_id))
+
+  cat("DEBUG: First 10 base_sample from TE data:\n")
+  print(head(unique(te_survival$base_sample), 10))
+  cat("DEBUG: First 10 base_sample from DOD data:\n")
+  print(head(kics_DOD_clean$base_sample, 10))
+
+  # Merge TE burden with survival data
+  survival_data <- te_survival %>%
+    select(base_sample, sample, total, LINE1, ALU, SVA, TP53_status, tumor_type, age_at_diagnosis) %>%
+    left_join(kics_DOD_clean, by = "base_sample") %>%
+    filter(!is.na(base_sample))
+
+  cat("Survival data merged:\n")
+  cat("  Total samples with TE data:", nrow(te_survival), "\n")
+  cat("  Samples matched with survival data:", sum(!is.na(survival_data$base_sample)), "\n")
+  cat("  Samples with Vital Status available:", sum(!is.na(survival_data$`Vital Status`)), "\n")
+
+  # Define high vs low TE burden (median split)
+  # If median is 0, use samples with total > 0 as "High"
+  median_te <- median(survival_data$total, na.rm = TRUE)
+
+  if (median_te == 0) {
+    cat("  Note: Median TE count is 0, using presence/absence split instead\n")
+    survival_data <- survival_data %>%
+      mutate(te_burden = ifelse(total > 0, "High", "Low"))
+  } else {
+    survival_data <- survival_data %>%
+      mutate(te_burden = ifelse(total >= median_te, "High", "Low"))
+  }
+
+  cat("TE burden groups:\n")
+  cat("  Median TE count:", median_te, "\n")
+  cat("  Number of samples with High TE burden:", sum(survival_data$te_burden == "High"), "\n")
+  cat("  Number of samples with Low TE burden:", sum(survival_data$te_burden == "Low"), "\n")
+
+  # Create time and event columns from kics_DOD data
+  # Handle "Not applicable" and "UNK" values in Age at Death
+
+  # Check if required columns exist
+  if (!"Vital Status" %in% colnames(survival_data)) {
+    cat("ERROR: 'Vital Status' column not found in merged data\n")
+    cat("Available columns:", paste(colnames(survival_data), collapse=", "), "\n")
+    return(data.frame())
+  }
+
+  if (!"Age at Death (days)" %in% colnames(survival_data)) {
+    cat("ERROR: 'Age at Death (days)' column not found in merged data\n")
+    cat("Available columns:", paste(colnames(survival_data), collapse=", "), "\n")
+    return(data.frame())
+  }
+
+  survival_data <- survival_data %>%
+    mutate(
+      # Convert Age at Death to numeric (will turn "Not applicable" and "UNK" to NA)
+      age_at_death_days = suppressWarnings(as.numeric(`Age at Death (days)`))
+    )
+
+  # Create event indicator
+  survival_data <- survival_data %>%
+    mutate(
+      event = case_when(
+        `Vital Status` == "Dead" ~ 1,
+        `Vital Status` == "Alive" ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+
+  cat("After creating event indicator:", nrow(survival_data), "rows\n")
+  cat("  Dead:", sum(survival_data$event == 1, na.rm=TRUE), "\n")
+  cat("  Alive:", sum(survival_data$event == 0, na.rm=TRUE), "\n")
+  cat("  NA events:", sum(is.na(survival_data$event)), "\n")
+
+  # Create time variable (time from diagnosis to death/censoring)
+  # For dead patients: age at death - age at diagnosis
+  # For alive patients: We need to estimate time from diagnosis to today
+  # Assuming diagnosis happened at age_at_diagnosis, we need current date to calculate follow-up
+  # Use today's date as censoring date for alive patients
+
+  current_year <- as.numeric(format(Sys.Date(), "%Y"))
+  current_day_of_year <- as.numeric(format(Sys.Date(), "%j"))
+
+  survival_data <- survival_data %>%
+    mutate(
+      age_at_diagnosis_days = age_at_diagnosis * 365.25,  # convert years to days
+      # For alive patients, we need to estimate years since diagnosis
+      # This requires knowing diagnosis year/date, which we may not have
+      # As a proxy, assume diagnosis happened recently and use a conservative estimate
+      time = case_when(
+        event == 1 & !is.na(age_at_death_days) & !is.na(age_at_diagnosis_days) ~
+          age_at_death_days - age_at_diagnosis_days,  # survival time from diagnosis to death
+        event == 0 & !is.na(age_at_diagnosis_days) ~
+          # For alive: use 5 years as default follow-up time (conservative estimate)
+          # This should be replaced with actual date of last contact if available
+          5 * 365.25,
+        TRUE ~ NA_real_
+      )
+    )
+
+  cat("WARNING: For alive patients, using 5-year default follow-up time.\n")
+  cat("         Ideally, date of last contact should be available in the data.\n")
+
+  cat("After creating time variable:", nrow(survival_data), "rows\n")
+  cat("  Rows with valid time:", sum(!is.na(survival_data$time)), "\n")
+  cat("  Rows with time > 0:", sum(survival_data$time > 0, na.rm=TRUE), "\n")
+  cat("  Rows with NA time:", sum(is.na(survival_data$time)), "\n")
+  cat("  Rows with time <= 0:", sum(survival_data$time <= 0, na.rm=TRUE), "\n")
+
+  survival_data <- survival_data %>%
+    filter(!is.na(time), !is.na(event), time > 0)  # Remove rows with missing or invalid survival data
+
+  cat("Samples with complete survival data:", nrow(survival_data), "\n")
+  if (nrow(survival_data) > 0) {
+    cat("  Event counts - Dead:", sum(survival_data$event == 1),
+        ", Alive:", sum(survival_data$event == 0), "\n")
+
+    # Check if we have both groups
+    n_high <- sum(survival_data$te_burden == "High")
+    n_low <- sum(survival_data$te_burden == "Low")
+    if (n_high == 0 || n_low == 0) {
+      cat("  WARNING: Only one TE burden group present. Cannot perform survival comparison.\n")
+    }
+  }
+
+  return(survival_data)
+}
+
+# Plot Kaplan-Meier survival curves comparing high vs low TE burden
+# Returns list with plot object, fit object, and test results
+plot_survival_curves <- function(survival_data, output_dir = NULL) {
+  if (nrow(survival_data) == 0 || sum(!is.na(survival_data$time)) == 0) {
+    cat("Warning: No samples with complete survival data available for plotting.\n")
+    return(NULL)
+  }
+
+  # Check if we have both groups
+  n_high <- sum(survival_data$te_burden == "High")
+  n_low <- sum(survival_data$te_burden == "Low")
+  if (n_high == 0 || n_low == 0) {
+    cat("Warning: Only one TE burden group present (High:", n_high, ", Low:", n_low, "). Cannot perform survival comparison.\n")
+    return(NULL)
+  }
+
+  # Calculate Kaplan-Meier estimates manually for ggplot
+  km_data <- survival_data %>%
+    arrange(te_burden, time) %>%
+    group_by(te_burden) %>%
+    mutate(
+      n_risk = n():1,  # number at risk (reverse order)
+      n_event = event,
+      surv_prob = cumprod(1 - n_event / n_risk)
+    ) %>%
+    ungroup()
+
+  # Create step data for plotting
+  km_steps <- km_data %>%
+    group_by(te_burden) %>%
+    arrange(time) %>%
+    mutate(
+      time_end = lead(time, default = max(time) * 1.1),
+      surv_prob_carry = surv_prob
+    ) %>%
+    select(te_burden, time, time_end, surv_prob = surv_prob_carry) %>%
+    ungroup()
+
+  # Create ggplot
+  p_survival <- ggplot(km_steps, aes(x = time, y = surv_prob, color = te_burden)) +
+    geom_step(linewidth = 1.2) +
+    scale_color_manual(
+      values = c("High" = "#E7B800", "Low" = "#2E9FDF"),
+      labels = c("High TE burden", "Low TE burden")
+    ) +
+    labs(
+      title = "Kaplan-Meier Survival Curves by TE Burden",
+      x = "Time (days)",
+      y = "Survival Probability",
+      color = "TE Burden"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    ylim(0, 1)
+
+  # Add sample size info
+  n_high_text <- paste0("High TE burden: n=", n_high)
+  n_low_text <- paste0("Low TE burden: n=", n_low)
+
+  p_survival <- p_survival +
+    annotate("text", x = max(km_steps$time) * 0.7, y = 0.15,
+             label = n_high_text, color = "#E7B800", size = 4, hjust = 0) +
+    annotate("text", x = max(km_steps$time) * 0.7, y = 0.08,
+             label = n_low_text, color = "#2E9FDF", size = 4, hjust = 0)
+
+  # Perform log-rank test if survival package is available
+  logrank_test <- NULL
+  fit <- NULL
+  if (requireNamespace("survival", quietly = TRUE)) {
+    tryCatch({
+      library(survival)
+      surv_obj <- Surv(time = survival_data$time, event = survival_data$event)
+      fit <- survfit(surv_obj ~ te_burden, data = survival_data)
+      logrank_test <- survdiff(surv_obj ~ te_burden, data = survival_data)
+
+      # Extract p-value
+      pval <- 1 - pchisq(logrank_test$chisq, df = 1)
+      pval_text <- sprintf("Log-rank p = %.4f", pval)
+
+      # Add p-value to plot
+      p_survival <- p_survival +
+        annotate("text", x = max(km_steps$time) * 0.7, y = 0.95,
+                 label = pval_text, size = 4.5, fontface = "bold")
+
+      cat("\nLog-rank test results:\n")
+      print(logrank_test)
+      cat("\nSurvival summary:\n")
+      print(summary(fit))
+    }, error = function(e) {
+      cat("Warning: Could not perform log-rank test:", e$message, "\n")
+    })
+  }
+
+  # Save plot if output directory provided
+  if (!is.null(output_dir)) {
+    ggsave(paste0(output_dir, "survival_te_burden.png"),
+           plot = p_survival, width = 10, height = 8)
+    cat("✓ Survival plot saved to:", paste0(output_dir, "survival_te_burden.png"), "\n")
+  }
+
+  return(list(
+    plot = p_survival,
+    fit = fit,
+    logrank_test = logrank_test
+  ))
+}
+
+# Test specific TE insertions for differential representation between groups
+# Uses Fisher's exact test with Benjamini-Hochberg multiple testing correction
+# Only tests TEs with sufficient sample representation (min_samples_with and min_samples_without)
+#
+# Args:
+#   te_expand: Expanded TE dataframe (one row per TE insertion)
+#   te_count: Count matrix (one row per sample) - used for total sample counts
+#   group_column: Column name for grouping (e.g., "TP53_status")
+#   min_samples_with: Minimum samples that must have the TE (default: 5)
+#   min_samples_without: Minimum samples that must not have the TE (default: 5)
+#   output_dir: Directory to save CSV files (optional)
+#   output_prefix: Prefix for output file names (default: "specific_tes")
+#
+# Returns:
+#   List with full results and significant results dataframes
+test_specific_tes_by_group <- function(te_expand, te_count, group_column,
+                                       min_samples_with = 5, min_samples_without = 5,
+                                       output_dir = NULL, output_prefix = "specific_tes") {
+
+  cat("Testing individual TE insertions for differential representation by", group_column, "...\n")
+
+  # Create a unique TE identifier for each insertion
+  te_expand_annotated <- te_expand %>%
+    mutate(te_id = paste(SV_chrom, SV_start, ALT, sep = "_"))
+
+  # Get unique group values
+  groups <- unique(te_count[[group_column]])
+  groups <- groups[!is.na(groups)]
+
+  if (length(groups) != 2) {
+    cat("Error: Expected exactly 2 groups, found", length(groups), "\n")
+    return(NULL)
+  }
+
+  group1 <- groups[1]
+  group2 <- groups[2]
+
+  cat("Comparing groups:", group1, "vs", group2, "\n")
+
+  # Get TE counts by group for each unique TE
+  te_by_group <- te_expand_annotated %>%
+    filter(!is.na(.data[[group_column]])) %>%
+    group_by(te_id, SV_chrom, SV_start, SV_end, ALT, .data[[group_column]]) %>%
+    summarise(
+      n_samples = n_distinct(sample),
+      samples = paste(unique(sample), collapse = ";"),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = all_of(group_column),
+      values_from = c(n_samples, samples),
+      values_fill = list(n_samples = 0, samples = "")
+    )
+
+  # Calculate total samples per group
+  n_group1 <- te_count %>% filter(.data[[group_column]] == group1) %>% nrow()
+  n_group2 <- te_count %>% filter(.data[[group_column]] == group2) %>% nrow()
+
+  cat("Total samples:", group1, "=", n_group1, ",", group2, "=", n_group2, "\n")
+
+  # Get column names dynamically
+  n_samples_col1 <- paste0("n_samples_", group1)
+  n_samples_col2 <- paste0("n_samples_", group2)
+
+  # Perform Fisher's exact test for each TE
+  te_test_results <- te_by_group %>%
+    mutate(
+      total_samples = .data[[n_samples_col1]] + .data[[n_samples_col2]],
+      freq_group1 = .data[[n_samples_col1]] / n_group1,
+      freq_group2 = .data[[n_samples_col2]] / n_group2,
+      fold_change = ifelse(freq_group1 == 0, Inf, freq_group2 / freq_group1),
+      samples_with_te = total_samples,
+      samples_without_te = (n_group1 + n_group2) - total_samples
+    ) %>%
+    # Filter for TEs with sufficient representation in EACH group
+    filter(.data[[n_samples_col1]] >= min_samples_with & .data[[n_samples_col2]] >= min_samples_with) %>%
+    rowwise() %>%
+    mutate(
+      # Fisher's exact test for count data
+      p_value = tryCatch({
+        fisher_matrix <- matrix(c(.data[[n_samples_col2]], n_group2 - .data[[n_samples_col2]],
+                                   .data[[n_samples_col1]], n_group1 - .data[[n_samples_col1]]),
+                                nrow = 2, byrow = TRUE)
+        fisher.test(fisher_matrix)$p.value
+      }, error = function(e) NA_real_)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(p_value)) %>%
+    mutate(
+      p_adj_BH = p.adjust(p_value, method = "BH"),
+      significant_BH = p_adj_BH < 0.05,
+      enriched_in = case_when(
+        !significant_BH ~ "Not significant",
+        freq_group2 > freq_group1 ~ group2,
+        freq_group1 > freq_group2 ~ group1,
+        TRUE ~ "Equal"
+      )
+    ) %>%
+    arrange(p_adj_BH)
+
+  # Print summary
+  cat("\nTotal TEs tested:", nrow(te_test_results), "\n")
+  cat("  (Filtered to TEs with >=", min_samples_with, "samples with TE in EACH group)\n")
+  cat("Significant TEs (BH < 0.05):", sum(te_test_results$significant_BH), "\n")
+  cat("  Enriched in", group2, ":", sum(te_test_results$enriched_in == group2), "\n")
+  cat("  Enriched in", group1, ":", sum(te_test_results$enriched_in == group1), "\n")
+
+  # Save to CSV if output directory provided
+  if (!is.null(output_dir)) {
+    # Full results
+    te_by_group_file <- paste0(output_dir, output_prefix, "_by_", group_column, ".csv")
+    write.csv(te_test_results, te_by_group_file, row.names = FALSE)
+    cat("✓ Full results saved to:", basename(te_by_group_file), "\n")
+
+    # Count significant results
+    te_test_results_sig <- te_test_results %>% filter(significant_BH)
+    if (nrow(te_test_results_sig) == 0) {
+      cat("  No significant results found\n")
+    } else {
+      cat("  Found", nrow(te_test_results_sig), "significant results\n")
+    }
+  }
+
+  return(list(
+    full_results = te_test_results,
+    significant_results = te_test_results %>% filter(significant_BH)
+  ))
+}
+
+# Test specific TE insertions grouped by gene for differential representation between groups
+# Aggregates all TEs within each gene before testing
+# Uses Fisher's exact test with Benjamini-Hochberg multiple testing correction
+#
+# Args:
+#   te_expand: Expanded TE dataframe (one row per TE insertion) - must have Gene_name column
+#   te_count: Count matrix (one row per sample) - used for total sample counts
+#   group_column: Column name for grouping (e.g., "TP53_status")
+#   min_samples_with: Minimum samples that must have TEs in the gene (default: 5)
+#   min_samples_without: Minimum samples that must not have TEs in the gene (default: 5)
+#   gene_filter: Optional vector of genes to test (e.g., cancer genes only)
+#   output_dir: Directory to save CSV files (optional)
+#   output_prefix: Prefix for output file names (default: "specific_tes_by_gene")
+#
+# Returns:
+#   List with full results and significant results dataframes
+test_specific_tes_by_gene <- function(te_expand, te_count, group_column,
+                                      min_samples_with = 5, min_samples_without = 5,
+                                      gene_filter = NULL,
+                                      output_dir = NULL, output_prefix = "specific_tes_by_gene") {
+
+  cat("Testing gene-level TE burden for differential representation by", group_column, "...\n")
+
+  # Filter to specific genes if requested
+  if (!is.null(gene_filter)) {
+    te_expand <- te_expand %>% filter(Gene_name %in% gene_filter)
+    cat("Filtered to", length(gene_filter), "genes\n")
+  }
+
+  # Get unique group values
+  groups <- unique(te_count[[group_column]])
+  groups <- groups[!is.na(groups)]
+
+  if (length(groups) != 2) {
+    cat("Error: Expected exactly 2 groups, found", length(groups), "\n")
+    return(NULL)
+  }
+
+  group1 <- groups[1]
+  group2 <- groups[2]
+
+  cat("Comparing groups:", group1, "vs", group2, "\n")
+
+  # Get samples with TEs in each gene by group
+  gene_by_group <- te_expand %>%
+    filter(!is.na(.data[[group_column]])) %>%
+    group_by(Gene_name, .data[[group_column]]) %>%
+    summarise(
+      n_samples = n_distinct(sample),
+      samples = paste(unique(sample), collapse = ";"),
+      n_insertions = n(),
+      .groups = "drop"
+    ) %>%
+    pivot_wider(
+      names_from = all_of(group_column),
+      values_from = c(n_samples, samples, n_insertions),
+      values_fill = list(n_samples = 0, samples = "", n_insertions = 0)
+    )
+
+  # Calculate total samples per group
+  n_group1 <- te_count %>% filter(.data[[group_column]] == group1) %>% nrow()
+  n_group2 <- te_count %>% filter(.data[[group_column]] == group2) %>% nrow()
+
+  cat("Total samples:", group1, "=", n_group1, ",", group2, "=", n_group2, "\n")
+
+  # Get column names dynamically
+  n_samples_col1 <- paste0("n_samples_", group1)
+  n_samples_col2 <- paste0("n_samples_", group2)
+  n_insertions_col1 <- paste0("n_insertions_", group1)
+  n_insertions_col2 <- paste0("n_insertions_", group2)
+
+  # Perform Fisher's exact test for each gene
+  gene_test_results <- gene_by_group %>%
+    mutate(
+      total_samples = .data[[n_samples_col1]] + .data[[n_samples_col2]],
+      total_insertions = .data[[n_insertions_col1]] + .data[[n_insertions_col2]],
+      freq_group1 = .data[[n_samples_col1]] / n_group1,
+      freq_group2 = .data[[n_samples_col2]] / n_group2,
+      fold_change = ifelse(freq_group1 == 0, Inf, freq_group2 / freq_group1)
+    ) %>%
+    # Filter for genes with sufficient representation
+    filter(.data[[n_samples_col1]] >= min_samples_with & .data[[n_samples_col2]] >= min_samples_with) %>%
+    rowwise() %>%
+    mutate(
+      # Fisher's exact test
+      p_value = tryCatch({
+        fisher_matrix <- matrix(c(.data[[n_samples_col2]], n_group2 - .data[[n_samples_col2]],
+                                   .data[[n_samples_col1]], n_group1 - .data[[n_samples_col1]]),
+                                nrow = 2, byrow = TRUE)
+        fisher.test(fisher_matrix)$p.value
+      }, error = function(e) NA_real_)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(p_value)) %>%
+    mutate(
+      p_adj = p.adjust(p_value, method = "BH"),
+      significant = p_adj < 0.05,
+      enriched_in = case_when(
+        !significant ~ "Not significant",
+        freq_group2 > freq_group1 ~ group2,
+        freq_group1 > freq_group2 ~ group1,
+        TRUE ~ "Equal"
+      )
+    ) %>%
+    arrange(p_value)
+
+  cat("✓ Tested", nrow(gene_test_results), "genes\n")
+  cat("  Found", sum(gene_test_results$significant), "significant genes (FDR < 0.05)\n")
+
+  # Save results if output directory provided
+  if (!is.null(output_dir)) {
+    gene_file <- paste0(output_dir, output_prefix, "_full_results.csv")
+    write.csv(gene_test_results, gene_file, row.names = FALSE)
+    cat("✓ Full results saved to:", basename(gene_file), "\n")
+  }
+
+  return(list(
+    full_results = gene_test_results,
+    significant_results = gene_test_results %>% filter(significant)
+  ))
+}
+
+# Plot TE frequency distributions for gnomAD and HostSeq before common filtering
+# Creates histograms showing how common/rare TEs are in reference populations
+#
+# Args:
+#   te_data: TE dataframe after prep_te (must have GRPMAX_AF column)
+#   output_dir: Directory to save plots
+#   output_prefix: Prefix for output file names (e.g., "tumour" or "germline")
+#
+# Returns:
+#   List with gnomad_plot and hostseq_plot
+plot_te_frequency_distributions <- function(te_data, output_dir = NULL, output_prefix = "te") {
+
+  cat("\n===== TE FREQUENCY DISTRIBUTIONS =====\n")
+
+  # Check if GRPMAX_AF column exists
+  if (!"GRPMAX_AF" %in% colnames(te_data)) {
+    cat("Warning: GRPMAX_AF column not found in data. Cannot plot gnomAD frequencies.\n")
+    return(NULL)
+  }
+
+  # Filter to unique TEs (by genomic position)
+  te_unique <- te_data %>%
+    distinct(SV_chrom, SV_start, ALT, .keep_all = TRUE)
+
+  cat("Total unique TEs:", nrow(te_unique), "\n")
+
+  # ===== PLOT 1: gnomAD Frequency Distribution =====
+  cat("\n--- gnomAD Frequency Distribution ---\n")
+
+  # Count TEs by gnomAD AF bins
+  gnomad_summary <- te_unique %>%
+    mutate(
+      gnomad_AF = as.numeric(GRPMAX_AF),
+      gnomad_category = case_when(
+        is.na(gnomad_AF) | gnomad_AF == 0 ~ "Not in gnomAD (AF=0)",
+        gnomad_AF < 0.001 ~ "Very rare (AF<0.1%)",
+        gnomad_AF < 0.01 ~ "Rare (0.1-1%)",
+        gnomad_AF < 0.05 ~ "Uncommon (1-5%)",
+        gnomad_AF >= 0.05 ~ "Common (AF≥5%)",
+        TRUE ~ "Unknown"
+      )
+    )
+
+  # Print summary
+  gnomad_counts <- table(gnomad_summary$gnomad_category)
+  cat("gnomAD frequency categories:\n")
+  print(gnomad_counts)
+
+  # Create histogram
+  gnomad_plot <- ggplot(gnomad_summary %>% filter(!is.na(gnomad_AF), gnomad_AF > 0),
+                         aes(x = gnomad_AF)) +
+    geom_histogram(bins = 50, fill = "blue", color = "black", alpha = 0.7) +
+    scale_x_log10(labels = scales::percent) +
+    labs(
+      title = "TE Frequency Distribution in gnomAD",
+      x = "gnomAD Allele Frequency (GRPMAX_AF)",
+      y = "Number of TEs"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.minor = element_blank()
+    ) +
+    geom_vline(xintercept = 0.03, linetype = "dashed", color = "red", size = 1) +
+    annotate("text", x = 0.03, y = Inf, label = "3% threshold",
+             vjust = -0.5, hjust = -0.1, color = "red", size = 3.5)
+
+  # Save plot
+  if (!is.null(output_dir)) {
+    ggsave(paste0(output_dir, output_prefix, "_gnomad_frequency.png"),
+           plot = gnomad_plot, width = 10, height = 6)
+    cat("✓ gnomAD plot saved to:", paste0(output_prefix, "_gnomad_frequency.png"), "\n")
+  }
+
+  cat("\n")
+
+  return(gnomad_plot)
+}
+
+# Plot TEs in dataset and their frequency in HostSeq
+# Shows each unique TE and what percentage of HostSeq samples have it
+#
+# Args:
+#   te_expand: TE expanded dataframe (one row per TE insertion)
+#   output_dir: Directory to save plot
+#   output_prefix: Prefix for output file name (e.g., "tumour" or "germline")
+#
+# Returns:
+#   ggplot object
+plot_te_hostseq_frequency <- function(te_expand, output_dir = NULL, output_prefix = "te") {
+
+  cat("\n===== TEs IN DATASET AND THEIR HOSTSEQ FREQUENCY =====\n")
+
+  # Identify HostSeq samples
+  hostseq_samples <- unique(te_expand$sample[grepl("^HS_", te_expand$sample)])
+  n_hostseq <- length(hostseq_samples)
+  cat("Number of HostSeq samples:", n_hostseq, "\n")
+
+  if (n_hostseq == 0) {
+    cat("Warning: No HostSeq samples found. Cannot calculate HostSeq frequencies.\n")
+    return(NULL)
+  }
+
+  # Get all unique TEs in the dataset
+  te_unique <- te_expand %>%
+    distinct(SV_chrom, SV_start, ALT, .keep_all = TRUE) %>%
+    mutate(te_id = paste(SV_chrom, SV_start, ALT, sep = "_"))
+
+  cat("Total unique TEs in dataset:", nrow(te_unique), "\n")
+
+  # Calculate frequency in HostSeq for each TE
+  te_hostseq_freq <- te_expand %>%
+    filter(grepl("^HS_", sample)) %>%
+    group_by(SV_chrom, SV_start, ALT) %>%
+    summarise(
+      n_hostseq_samples = n_distinct(sample),
+      freq_in_hostseq = n_hostseq_samples / n_hostseq,
+      .groups = "drop"
+    ) %>%
+    mutate(te_id = paste(SV_chrom, SV_start, ALT, sep = "_"))
+
+  # Merge with all TEs (TEs not in HostSeq will have freq = 0)
+  te_freq_complete <- te_unique %>%
+    select(te_id, SV_chrom, SV_start, ALT) %>%
+    left_join(te_hostseq_freq %>% select(te_id, n_hostseq_samples, freq_in_hostseq),
+              by = "te_id") %>%
+    mutate(
+      n_hostseq_samples = ifelse(is.na(n_hostseq_samples), 0, n_hostseq_samples),
+      freq_in_hostseq = ifelse(is.na(freq_in_hostseq), 0, freq_in_hostseq)
+    ) %>%
+    arrange(desc(freq_in_hostseq))
+
+  cat("TEs found in HostSeq:", sum(te_freq_complete$n_hostseq_samples > 0), "\n")
+  cat("TEs not in HostSeq:", sum(te_freq_complete$n_hostseq_samples == 0), "\n")
+
+  # Summary statistics
+  cat("\nHostSeq frequency summary:\n")
+  cat("  Min:", min(te_freq_complete$freq_in_hostseq), "\n")
+  cat("  Median:", median(te_freq_complete$freq_in_hostseq), "\n")
+  cat("  Mean:", mean(te_freq_complete$freq_in_hostseq), "\n")
+  cat("  Max:", max(te_freq_complete$freq_in_hostseq), "\n")
+
+  # Create plot
+  p <- ggplot(te_freq_complete, aes(x = freq_in_hostseq)) +
+    geom_histogram(bins = 50, fill = "blue", color = "black", alpha = 0.7) +
+    scale_x_continuous(labels = scales::percent,
+                       breaks = seq(0, max(te_freq_complete$freq_in_hostseq), by = 0.1)) +
+    labs(
+      title = paste0("TE Frequency in HostSeq Cohort\n(", nrow(te_freq_complete),
+                     " unique TEs, ", n_hostseq, " HostSeq samples)"),
+      x = "Frequency in HostSeq",
+      y = "Number of TEs"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.minor = element_blank()
+    ) +
+    geom_vline(xintercept = 0.03, linetype = "dashed", color = "red", size = 1) +
+    annotate("text", x = 0.03, y = Inf, label = "3% threshold",
+             vjust = -0.5, hjust = -0.1, color = "red", size = 3.5)
+
+  # Save plot
+  if (!is.null(output_dir)) {
+    ggsave(paste0(output_dir, output_prefix, "_te_hostseq_frequency.png"),
+           plot = p, width = 10, height = 6)
+    cat("✓ Plot saved to:", paste0(output_prefix, "_te_hostseq_frequency.png"), "\n")
+  }
+
+  return(p)
+}
+
+#### ANCESTRY PCA FUNCTIONS ####
+
+# Merge location windows with ancestry data
+# Args:
+#   location_df: Data frame with location window counts (from 100kb_complete_filtered_g.csv or _t.csv)
+#   ancestry_df: Ancestry data frame with predicted_ancestry_thres column
+# Returns:
+#   Merged data frame
+merge_location_ancestry <- function(location_df, ancestry_df) {
+  cat("\n===== MERGING LOCATION WINDOWS WITH ANCESTRY =====\n")
+
+  # Check for sample column
+  if (!"sample" %in% colnames(location_df)) {
+    stop("location_df must have a 'sample' column")
+  }
+  if (!"sample" %in% colnames(ancestry_df)) {
+    stop("ancestry_df must have a 'sample' column")
+  }
+
+  # Determine if this is tumor data (has _T suffix) or germline data (has _N suffix)
+  sample_example <- location_df$sample[1]
+  is_tumor <- grepl("_T$", sample_example)
+
+  cat("Data type detected:", ifelse(is_tumor, "TUMOR", "GERMLINE"), "\n")
+  cat("Example sample:", sample_example, "\n")
+
+  # Prepare ancestry data for merging
+  if (is_tumor) {
+    # For tumor data: Remove _N from ancestry to create base_sample
+    # Tumor samples like "0074_20-10579-A-02-00_T" have base_sample "0074"
+    # Ancestry samples like "0074_N" become base_sample "0074"
+    cat("Using base_sample matching for tumor data\n")
+
+    # Create base_sample in ancestry (remove _N)
+    ancestry_for_merge <- ancestry_df %>%
+      mutate(base_sample = gsub("_N$", "", sample)) %>%
+      select(-sample)
+
+    # Create base_sample in location data if not present
+    if (!"base_sample" %in% colnames(location_df)) {
+      location_df <- location_df %>%
+        mutate(base_sample = gsub("_.*_T$", "", sample))  # Extract base ID before tissue/flowcell info
+    }
+
+    # Merge on base_sample
+    merged <- location_df %>%
+      left_join(ancestry_for_merge, by = "base_sample")
+
+  } else {
+    # For germline data: Direct sample matching (both end in _N)
+    cat("Using direct sample matching for germline data\n")
+
+    # Merge - include both predicted_ancestry_thres and mapped_label
+    ancestry_cols <- c("sample", "predicted_ancestry_thres")
+    if ("mapped_label" %in% colnames(ancestry_df)) {
+      ancestry_cols <- c(ancestry_cols, "mapped_label")
+    }
+
+    merged <- location_df %>%
+      left_join(ancestry_df %>% select(all_of(ancestry_cols)), by = "sample")
+  }
+
+  cat("Location windows samples:", length(unique(location_df$sample)), "\n")
+  cat("Ancestry samples:", length(unique(ancestry_df$sample)), "\n")
+  cat("Merged samples with ancestry:", sum(!is.na(merged$predicted_ancestry_thres)), "\n")
+  cat("Merged samples missing ancestry:", sum(is.na(merged$predicted_ancestry_thres)), "\n")
+
+  # Show examples of unmatched samples
+  if (sum(is.na(merged$predicted_ancestry_thres)) > 0) {
+    unmatched <- unique(merged$sample[is.na(merged$predicted_ancestry_thres)])
+    cat("\nFirst 10 unmatched samples:\n")
+    print(head(unmatched, 10))
+  }
+
+  cat("====================================================\n\n")
+
+  return(merged)
+}
+
+
+# Perform PCA on location window counts
+# Args:
+#   location_df: Data frame with location window counts
+#   exclude_cols: Column names to exclude from PCA (clinical, ancestry, sample ID, etc.)
+# Returns:
+#   List with PCA results and transformed data
+perform_location_pca <- function(location_df, exclude_cols = c("sample", "predicted_ancestry_thres", "mapped_label")) {
+  cat("\n===== PERFORMING PCA ON LOCATION WINDOWS =====\n")
+
+  # Identify location window columns (exclude clinical/ancestry/sample columns)
+  all_cols <- colnames(location_df)
+  location_cols <- setdiff(all_cols, exclude_cols)
+
+  # Select only these columns
+  location_data <- location_df[, location_cols, drop = FALSE]
+
+  # Keep only numeric columns
+  numeric_cols <- sapply(location_data, is.numeric)
+  location_data <- location_data[, numeric_cols, drop = FALSE]
+
+  # Remove columns that are all NA or constant
+  location_data <- location_data[, sapply(location_data, function(x) {
+    length(unique(x[!is.na(x)])) > 1
+  }), drop = FALSE]
+
+  cat("Total columns:", length(all_cols), "\n")
+  cat("Numeric columns after filtering:", ncol(location_data), "\n")
+  cat("Samples:", nrow(location_data), "\n")
+
+  # Handle missing values - impute with column mean
+  for (col in colnames(location_data)) {
+    if (any(is.na(location_data[[col]]))) {
+      location_data[[col]][is.na(location_data[[col]])] <- mean(location_data[[col]], na.rm = TRUE)
+    }
+  }
+
+  # Perform PCA
+  pca_result <- prcomp(location_data, center = TRUE, scale. = TRUE)
+
+  # Create data frame with PCA results
+  # Start with PC coordinates
+  pca_df <- data.frame(
+    sample = location_df$sample,
+    PC1 = pca_result$x[, 1],
+    PC2 = pca_result$x[, 2]
+  )
+
+  # Add back all excluded columns from original data (for coloring plots)
+  # This includes both numeric and non-numeric clinical/ancestry columns
+  excluded_cols_to_add <- setdiff(exclude_cols, "sample")  # Don't duplicate sample
+  for (col in excluded_cols_to_add) {
+    if (col %in% colnames(location_df)) {
+      pca_df[[col]] <- location_df[[col]]
+    }
+  }
+
+  # Calculate variance explained
+  var_explained <- summary(pca_result)$importance[2, 1:2] * 100
+
+  cat("PC1 variance explained:", round(var_explained[1], 2), "%\n")
+  cat("PC2 variance explained:", round(var_explained[2], 2), "%\n")
+  cat("===============================================\n\n")
+
+  return(list(
+    pca_result = pca_result,
+    pca_df = pca_df,
+    var_explained = var_explained
+  ))
+}
+
+# Plot PCA colored by predicted ancestry or mapped label
+# Args:
+#   pca_result: List returned from perform_location_pca()
+#   color_by: Column name to color by (e.g., "predicted_ancestry_thres" or "mapped_label")
+#   output_dir: Directory to save plot
+#   plot_prefix: Prefix for plot filename
+# Returns:
+#   ggplot object
+plot_pca_ancestry <- function(pca_result, color_by = "predicted_ancestry_thres",
+                              output_dir = NULL, plot_prefix = "germline") {
+  pca_df <- pca_result$pca_df
+  var_explained <- pca_result$var_explained
+
+  # Check if color_by column exists
+  if (!color_by %in% colnames(pca_df)) {
+    stop(paste0("Column '", color_by, "' not found in PCA data frame"))
+  }
+
+  # Remove samples with missing values in color_by column
+  pca_df_filtered <- pca_df %>% filter(!is.na(.data[[color_by]]))
+
+  # Set title based on color_by
+  plot_title <- if (color_by == "predicted_ancestry_thres") {
+    "PCA of TE Location Windows Colored by Predicted Ancestry"
+  } else if (color_by == "mapped_label") {
+    "PCA of TE Location Windows Colored by Mapped Label"
+  } else {
+    paste0("PCA of TE Location Windows Colored by ", color_by)
+  }
+
+  legend_title <- if (color_by == "predicted_ancestry_thres") {
+    "Predicted Ancestry"
+  } else if (color_by == "mapped_label") {
+    "Mapped Label"
+  } else {
+    color_by
+  }
+
+  p <- ggplot(pca_df_filtered, aes(x = PC1, y = PC2, color = .data[[color_by]])) +
+    geom_point(size = 3, alpha = 0.7) +
+    labs(
+      title = plot_title,
+      x = paste0("PC1 (", round(var_explained[1], 2), "% variance)"),
+      y = paste0("PC2 (", round(var_explained[2], 2), "% variance)"),
+      color = legend_title
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "right"
+    )
+
+  # Save plot
+  if (!is.null(output_dir)) {
+    filename <- paste0(plot_prefix, "_pca_", color_by, ".png")
+    ggsave(paste0(output_dir, "pca_umap/", filename), plot = p, width = 10, height = 8)
+    cat("✓ PCA plot saved to:", filename, "\n")
+  }
+
+  return(p)
+}
+
+# Plot pie chart of predicted ancestry
+# Args:
+#   ancestry_df: Data frame with predicted_ancestry_thres column (after merging with samples)
+#   output_dir: Directory to save plot
+#   plot_prefix: Prefix for plot filename
+# Returns:
+#   ggplot object
+plot_ancestry_pie <- function(ancestry_df, output_dir = NULL, plot_prefix = "germline") {
+  # Count ancestry categories
+  ancestry_counts <- ancestry_df %>%
+    filter(!is.na(predicted_ancestry_thres)) %>%
+    group_by(predicted_ancestry_thres) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(
+      percentage = round(count / sum(count) * 100, 1),
+      label = paste0(predicted_ancestry_thres, "\n", count, " (", percentage, "%)")
+    )
+
+  cat("\nAncestry distribution:\n")
+  print(ancestry_counts)
+
+  p <- ggplot(ancestry_counts, aes(x = "", y = count, fill = predicted_ancestry_thres)) +
+    geom_bar(stat = "identity", width = 1, color = "white") +
+    coord_polar("y", start = 0) +
+    geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 4) +
+    labs(
+      title = "Distribution of Predicted Ancestry",
+      fill = "Predicted Ancestry"
+    ) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "right"
+    )
+
+  # Save plot
+  if (!is.null(output_dir)) {
+    ggsave(paste0(output_dir, "dataset/", plot_prefix, "_ancestry_pie.png"),
+           plot = p, width = 10, height = 8)
+    cat("✓ Ancestry pie chart saved to:", paste0(plot_prefix, "_ancestry_pie.png"), "\n")
+  }
+
+  return(p)
+}
+
+# Plot pie charts for HostSeq ancestry distribution by filter/analysis group
+# Creates 3 pie charts showing ancestry distribution for:
+#   1. All HostSeq samples
+#   2. HostSeq filter group (used for determining common TEs)
+#   3. HostSeq analysis group (used for final analysis)
+#
+# Args:
+#   te_data: TE dataframe with hostseq_group and predicted_ancestry_thres columns
+#   output_dir: Directory to save plots (optional)
+#   plot_prefix: Prefix for plot filenames (default: "germline")
+# Returns:
+#   List with three ggplot objects (all, filter, analysis)
+plot_hostseq_ancestry_pies <- function(te_data, output_dir = NULL, plot_prefix = "germline", ancestry_col = "predicted_ancestry_thres") {
+
+  cat("\n===== PLOTTING HOSTSEQ ANCESTRY PIE CHARTS =====\n")
+  cat("Using ancestry column:", ancestry_col, "\n")
+
+  # Filter for HostSeq samples only
+  hostseq_data <- te_data %>%
+    filter(grepl("^HS_", sample)) %>%
+    distinct(sample, .keep_all = TRUE)
+
+  if (nrow(hostseq_data) == 0) {
+    cat("Warning: No HostSeq samples found in data\n")
+    return(NULL)
+  }
+
+  cat("Total HostSeq samples:", nrow(hostseq_data), "\n")
+
+  # Helper function to create a single pie chart
+  create_ancestry_pie <- function(data, title_suffix) {
+    # Use the specified ancestry column dynamically
+    ancestry_counts <- data %>%
+      filter(!is.na(!!sym(ancestry_col))) %>%
+      group_by(!!sym(ancestry_col)) %>%
+      summarise(count = n(), .groups = "drop") %>%
+      mutate(
+        percentage = round(count / sum(count) * 100, 1),
+        label = paste0(!!sym(ancestry_col), "\n", count, " (", percentage, "%)")
+      )
+
+    cat("\n", title_suffix, "- Ancestry distribution:\n", sep = "")
+    print(ancestry_counts)
+
+    p <- ggplot(ancestry_counts, aes(x = "", y = count, fill = !!sym(ancestry_col))) +
+      geom_bar(stat = "identity", width = 1, color = "white") +
+      coord_polar("y", start = 0) +
+      geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 3.5) +
+      labs(
+        title = paste0("HostSeq Ancestry Distribution\n(", title_suffix, ")"),
+        fill = ancestry_col
+      ) +
+      theme_void() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+        legend.position = "right"
+      )
+
+    return(p)
+  }
+
+  # Create pie chart for all HostSeq samples
+  p_all <- create_ancestry_pie(hostseq_data, "All HostSeq")
+
+  # Create pie chart for filter group
+  filter_data <- hostseq_data %>% filter(hostseq_group == "filter")
+  p_filter <- if (nrow(filter_data) > 0) {
+    create_ancestry_pie(filter_data, "Filter Group")
+  } else {
+    cat("Warning: No HostSeq filter group samples found\n")
+    NULL
+  }
+
+  # Create pie chart for analysis group
+  analysis_data <- hostseq_data %>% filter(hostseq_group == "analysis")
+  p_analysis <- if (nrow(analysis_data) > 0) {
+    create_ancestry_pie(analysis_data, "Analysis Group")
+  } else {
+    cat("Warning: No HostSeq analysis group samples found\n")
+    NULL
+  }
+
+  # Save plots
+  if (!is.null(output_dir)) {
+    dir.create(paste0(output_dir, "dataset/"), showWarnings = FALSE, recursive = TRUE)
+
+    # Add suffix to filename if using mapped_label instead of default
+    file_suffix <- if (ancestry_col == "mapped_label") "_mapped" else ""
+
+    if (!is.null(p_all)) {
+      ggsave(paste0(output_dir, "dataset/", plot_prefix, "_hostseq_ancestry_all", file_suffix, ".pdf"),
+             plot = p_all, width = 7, height = 5)
+      cat("✓ All HostSeq ancestry pie saved\n")
+    }
+
+    if (!is.null(p_filter)) {
+      ggsave(paste0(output_dir, "dataset/", plot_prefix, "_hostseq_ancestry_filter", file_suffix, ".pdf"),
+             plot = p_filter, width = 7, height = 5)
+      cat("✓ Filter group ancestry pie saved\n")
+    }
+
+    if (!is.null(p_analysis)) {
+      ggsave(paste0(output_dir, "dataset/", plot_prefix, "_hostseq_ancestry_analysis", file_suffix, ".pdf"),
+             plot = p_analysis, width = 7, height = 5)
+      cat("✓ Analysis group ancestry pie saved\n")
+    }
+  }
+
+  cat("=====================================\n\n")
+
+  return(list(
+    all = p_all,
+    filter = p_filter,
+    analysis = p_analysis
+  ))
+}
+
+# Perform UMAP on location window counts
+# Args:
+#   location_df: Data frame with location window counts
+#   exclude_cols: Column names to exclude from UMAP (clinical, ancestry, sample ID, etc.)
+# Returns:
+#   List with UMAP results and transformed data
+perform_location_umap <- function(location_df, exclude_cols = c("sample", "predicted_ancestry_thres", "mapped_label")) {
+  cat("\n===== PERFORMING UMAP ON LOCATION WINDOWS =====\n")
+
+  # Identify location window columns (exclude clinical/ancestry/sample columns)
+  all_cols <- colnames(location_df)
+  location_cols <- setdiff(all_cols, exclude_cols)
+
+  # Select only these columns
+  location_data <- location_df[, location_cols, drop = FALSE]
+
+  # Keep only numeric columns
+  numeric_cols <- sapply(location_data, is.numeric)
+  location_data <- location_data[, numeric_cols, drop = FALSE]
+
+  # Remove columns that are all NA or constant
+  location_data <- location_data[, sapply(location_data, function(x) {
+    length(unique(x[!is.na(x)])) > 1
+  }), drop = FALSE]
+
+  cat("Total columns:", length(all_cols), "\n")
+  cat("Numeric columns after filtering:", ncol(location_data), "\n")
+  cat("Samples:", nrow(location_data), "\n")
+
+  # Handle missing values - impute with column mean
+  for (col in colnames(location_data)) {
+    if (any(is.na(location_data[[col]]))) {
+      location_data[[col]][is.na(location_data[[col]])] <- mean(location_data[[col]], na.rm = TRUE)
+    }
+  }
+
+  # Perform UMAP
+  umap_result <- umap(location_data, n_neighbors = 25, min_dist = 0.3)
+
+  # Create data frame with UMAP results
+  # Start with UMAP coordinates
+  umap_df <- data.frame(
+    sample = location_df$sample,
+    UMAP1 = umap_result$layout[, 1],
+    UMAP2 = umap_result$layout[, 2]
+  )
+
+  # Add back all excluded columns from original data (for coloring plots)
+  # This includes both numeric and non-numeric clinical/ancestry columns
+  excluded_cols_to_add <- setdiff(exclude_cols, "sample")  # Don't duplicate sample
+  for (col in excluded_cols_to_add) {
+    if (col %in% colnames(location_df)) {
+      umap_df[[col]] <- location_df[[col]]
+    }
+  }
+
+  cat("UMAP completed successfully\n")
+  cat("===============================================\n\n")
+
+  return(list(
+    umap_result = umap_result,
+    umap_df = umap_df
+  ))
+}
+
+# Plot UMAP colored by predicted ancestry or mapped label
+# Args:
+#   umap_result: List returned from perform_location_umap()
+#   color_by: Column name to color by (e.g., "predicted_ancestry_thres" or "mapped_label")
+#   output_dir: Directory to save plot
+#   plot_prefix: Prefix for plot filename
+# Returns:
+#   ggplot object
+plot_umap_ancestry <- function(umap_result, color_by = "predicted_ancestry_thres",
+                               output_dir = NULL, plot_prefix = "germline") {
+  umap_df <- umap_result$umap_df
+
+  # Check if color_by column exists
+  if (!color_by %in% colnames(umap_df)) {
+    stop(paste0("Column '", color_by, "' not found in UMAP data frame"))
+  }
+
+  # Remove samples with missing values in color_by column
+  umap_df_filtered <- umap_df %>% filter(!is.na(.data[[color_by]]))
+
+  # Set title based on color_by
+  plot_title <- if (color_by == "predicted_ancestry_thres") {
+    "UMAP of TE Location Windows Colored by Predicted Ancestry"
+  } else if (color_by == "mapped_label") {
+    "UMAP of TE Location Windows Colored by Mapped Label"
+  } else {
+    paste0("UMAP of TE Location Windows Colored by ", color_by)
+  }
+
+  legend_title <- if (color_by == "predicted_ancestry_thres") {
+    "Predicted Ancestry"
+  } else if (color_by == "mapped_label") {
+    "Mapped Label"
+  } else {
+    color_by
+  }
+
+  p <- ggplot(umap_df_filtered, aes(x = UMAP1, y = UMAP2, color = .data[[color_by]])) +
+    geom_point(size = 3, alpha = 0.7) +
+    labs(
+      title = plot_title,
+      x = "UMAP1",
+      y = "UMAP2",
+      color = legend_title
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "right"
+    )
+
+  # Save plot
+  if (!is.null(output_dir)) {
+    filename <- paste0(plot_prefix, "_umap_", color_by, ".png")
+    ggsave(paste0(output_dir, "pca_umap/", filename), plot = p, width = 10, height = 8)
+    cat("✓ UMAP plot saved to:", filename, "\n")
+  }
+
+  return(p)
+}
+
+
+# Generic wrapper to plot PCA colored by any variable
+# Args:
+#   pca_result: List returned from perform_location_pca()
+#   color_by: Column name to color by (e.g., "tumor_type", "total", "cohort")
+#   plot_title: Custom title for the plot (optional)
+#   output_dir: Directory to save plot
+#   plot_prefix: Prefix for plot filename
+# Returns:
+#   ggplot object
+plot_pca_by_variable <- function(pca_result, color_by, plot_title = NULL,
+                                 output_dir = NULL, plot_prefix = "germline") {
+  # Check if color_by column exists in PCA data
+  if (!color_by %in% colnames(pca_result$pca_df)) {
+    cat("Warning: Column '", color_by, "' not found in PCA data frame - skipping plot\n")
+    return(NULL)
+  }
+
+  # Use the existing plot_pca_ancestry function which already handles any color_by variable
+  if (is.null(plot_title)) {
+    # Generate title based on color_by if not provided
+    plot_title <- paste0("PCA of TE Location Windows Colored by ", gsub("_", " ", color_by))
+  }
+
+  # Call the existing function but override the title
+  p <- plot_pca_ancestry(pca_result, color_by = color_by,
+                        output_dir = output_dir, plot_prefix = plot_prefix)
+
+  # Update title if custom one provided
+  p <- p + labs(title = plot_title)
+
+  return(p)
+}
+
+# Generic wrapper to plot UMAP colored by any variable
+# Args:
+#   umap_result: List returned from perform_location_umap()
+#   color_by: Column name to color by (e.g., "tumor_type", "total", "cohort")
+#   plot_title: Custom title for the plot (optional)
+#   output_dir: Directory to save plot
+#   plot_prefix: Prefix for plot filename
+# Returns:
+#   ggplot object
+plot_umap_by_variable <- function(umap_result, color_by, plot_title = NULL,
+                                  output_dir = NULL, plot_prefix = "germline") {
+  # Check if color_by column exists in UMAP data
+  if (!color_by %in% colnames(umap_result$umap_df)) {
+    cat("Warning: Column '", color_by, "' not found in UMAP data frame - skipping plot\n")
+    return(NULL)
+  }
+
+  # Use the existing plot_umap_ancestry function which already handles any color_by variable
+  if (is.null(plot_title)) {
+    # Generate title based on color_by if not provided
+    plot_title <- paste0("UMAP of TE Location Windows Colored by ", gsub("_", " ", color_by))
+  }
+
+  # Call the existing function but override the title
+  p <- plot_umap_ancestry(umap_result, color_by = color_by,
+                         output_dir = output_dir, plot_prefix = plot_prefix)
+
+  # Update title if custom one provided
+  p <- p + labs(title = plot_title)
+
+  return(p)
+}
+
+# ============================================================================
+# Regulatory Elements (RE) Analysis Functions
+# ============================================================================
+
+# Load RE report data and join to TE dataframe by ID
+#
+# This function loads regulatory elements data from an external report file
+# and joins it to the input dataframe based on the ID column.
+#
+# @param df A dataframe with an ID column (typically TE data)
+# @param re_report_path Path to the RE report file
+# @return A dataframe with RE annotations joined
+load_and_join_re_data <- function(df, re_report_path) {
+  # Load RE report
+  re_data <- fread(re_report_path, header = FALSE)
+
+  # Add column names
+  colnames(re_data) <- c("chr", "start", "end", "ins", "sample", "ID", "ref", "ALT", "x",
+                         "filter", "info", "y", "genotype", "chr_reg", "start_reg", "end_reg",
+                         "type_reg", "gene_reg")
+
+  # Join to input dataframe by ID
+  # Use left_join to keep all rows from df, or inner_join to keep only matches
+  # Setting multiple = "all" to handle cases where one TE maps to multiple RE regions
+  df_re <- df %>%
+    inner_join(re_data, by = "ID", multiple = "all")
+
+  cat("Loaded RE data with", nrow(re_data), "rows\n")
+  cat("Joined to split dataframe:", nrow(df_re), "rows out of", nrow(df),
+      "(", round(100 * nrow(df_re) / nrow(df), 1), "%)\n")
+
+  return(df_re)
+}
+
+# Split gene_reg column into one gene per row
+#
+# This function takes a dataframe with a gene_reg column containing semicolon-
+# separated gene names and expands it so that each gene gets its own row.
+# This is necessary for pathway analysis which requires one gene per row.
+#
+# @param df A dataframe with a gene_reg column
+# @return A dataframe with one row per gene
+split_re_genes <- function(df) {
+  # Count rows before splitting
+  n_before <- nrow(df)
+
+  # Split genes using separate_rows (same approach as existing Gene_name splitting)
+  df_split <- df %>%
+    separate_rows(gene_reg, sep = ";") %>%
+    filter(!is.na(gene_reg) & gene_reg != "")
+
+  # Count rows after splitting
+  n_after <- nrow(df_split)
+
+  cat("Split gene_reg column:", n_before, "rows ->", n_after, "rows\n")
+  cat("Expansion factor:", round(n_after / n_before, 2), "x\n")
+  cat("Unique genes:", length(unique(df_split$gene_reg)), "\n")
+
+  return(df_split)
+}
+
+# Perform ORA comparing Affected vs Unaffected cancer status
+#
+# This function performs over-representation analysis to compare gene sets
+# between samples with Affected vs Unaffected cancer status.
+#
+# @param df A dataframe with Gene_name and Cancer columns
+# @return compareCluster ORA results object
+# Perform ORA with custom cutoffs for cancer status (Affected vs Unaffected)
+perform_ora_cancer_status_custom_cutoffs <- function(df, p_pathway = 0.05, q_pathway = 0.1, nsample_thresh = 0, gene_col = "Gene_name") {
+  # Filter genes by sample threshold if specified
+  if (nsample_thresh > 0) {
+    # First, identify groups that meet the sample threshold
+    samples_per_group <- df %>%
+      group_by(Cancer) %>%
+      summarise(n_samples = n_distinct(sample.x), .groups = "drop")
+
+    groups_with_enough_samples <- samples_per_group %>%
+      filter(n_samples >= nsample_thresh) %>%
+      pull(Cancer)
+
+    cat("Groups with >=", nsample_thresh, "samples:", paste(groups_with_enough_samples, collapse=", "), "\n")
+
+    # If fewer than 2 groups meet threshold, return NULL
+    if (length(groups_with_enough_samples) < 2) {
+      cat("Insufficient groups (need at least 2 groups with >=", nsample_thresh, "samples)\n")
+      return(NULL)
+    }
+
+    # Filter to only groups that meet the threshold
+    df <- df %>% filter(Cancer %in% groups_with_enough_samples)
+
+    cat("After filtering groups:", length(unique(df[[gene_col]])), "genes across", length(groups_with_enough_samples), "groups\n")
+  }
+
+  # Over-representation analysis comparing groups
+  geneClusters_ora <- lapply(split(df[[gene_col]], df$Cancer), unique)
+
+  # Perform ORA with compareCluster
+  ora_cancer_status <- compareCluster(
+    geneCluster = geneClusters_ora,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = p_pathway,
+    qvalueCutoff = q_pathway
+  )
+
+  # Return the ORA results
+  return(ora_cancer_status)
+}
+
+# Perform pathway analysis on regulatory elements genes
+#
+# This function performs over-representation analysis (ORA) on genes from
+# regulatory elements, using the existing pathway analysis functions.
+# It handles renaming gene_reg to Gene_name for compatibility.
+#
+# @param df_re_split A split dataframe with gene_reg column (one gene per row)
+# @param analysis_type Type of analysis: "general", "tp53", "cancer", or "cancer_status"
+# @return ORA results object
+perform_re_pathway_analysis <- function(df_re_split, analysis_type = "general", min_samples = 0, p_pathway = 0.05, q_pathway = 0.1) {
+  # Convert to data.frame if it's a tibble
+  df_for_ora <- as.data.frame(df_re_split)
+
+  # Determine which gene column to use
+  if ("gene_reg" %in% colnames(df_for_ora)) {
+    cat("Using gene_reg column from RE data\n")
+    gene_column <- "gene_reg"
+  } else if ("Gene_name" %in% colnames(df_for_ora)) {
+    cat("Using Gene_name column\n")
+    gene_column <- "Gene_name"
+  } else {
+    stop("Neither gene_reg nor Gene_name column found in dataframe. Available columns: ",
+         paste(colnames(df_for_ora), collapse=", "))
+  }
+
+  cat("Performing", analysis_type, "pathway analysis on RE genes\n")
+  cat("Unique genes for analysis:", length(unique(df_for_ora[[gene_column]])), "\n")
+
+  # Perform appropriate ORA based on analysis type, passing gene column name
+  ora_result <- switch(analysis_type,
+    "general" = perform_ora_custom_cutoffs(df_for_ora, p_pathway = p_pathway, q_pathway = q_pathway, nsample_thresh = min_samples, filter_exon = FALSE, gene_col = gene_column),
+    "tp53" = perform_ora_tp53_custom_cutoffs(df_for_ora, p_pathway = p_pathway, q_pathway = q_pathway, nsample_thresh = min_samples, gene_col = gene_column),
+    "cancer" = perform_ora_cancer_custom_cutoffs(df_for_ora, p_pathway = p_pathway, q_pathway = q_pathway, nsample_thresh = min_samples, gene_col = gene_column),
+    "cancer_status" = perform_ora_cancer_status_custom_cutoffs(df_for_ora, p_pathway = p_pathway, q_pathway = q_pathway, nsample_thresh = min_samples, gene_col = gene_column),
+    "sample_type" = perform_ora_sample_type_custom_cutoffs(df_for_ora, p_pathway = p_pathway, q_pathway = q_pathway, nsample_thresh = min_samples, sample_type_column = "sample_type", gene_col = gene_column),
+    stop("Unknown analysis_type. Use 'general', 'tp53', 'cancer', 'cancer_status', or 'sample_type'")
+  )
+
+  return(ora_result)
+}
+
+perform_ora_cancer_status <- function(df) {
+  # Over-representation analysis comparing Affected vs Unaffected
+  geneClusters_ora <- lapply(split(df$Gene_name, df$Cancer), unique)
+
+  # Perform ORA with compareCluster
+  ora_cancer_status <- compareCluster(
+    geneCluster = geneClusters_ora,
+    fun = "enrichGO",
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.1
+  )
+
+  # Return the ORA results
+  return(ora_cancer_status)
+}
+
+# Test RNA expression differences by TE status at gene from RE report
+#
+# This function takes an RE report, identifies genes with sufficient TE occurrences,
+# and tests whether RNA expression differs between samples with/without TEs at each gene.
+#
+# @param re_report_path Path to the RE report file
+# @param rna_data RNA expression data (genes × samples with gene_name column)
+# @param sample_type "germline" or "tumour" - affects sample ID parsing
+# @param min_gene_mentions Minimum number of times a gene must appear in RE report (default: 3)
+# @param min_samples_per_group Minimum samples required in each group for testing (default: 3)
+# @return Dataframe with differential expression results
+test_rna_by_gene_re_status <- function(re_report_path, rna_data, sample_type = "germline",
+                                       min_gene_mentions = 3, min_samples_per_group = 3) {
+
+  cat("\n=== Testing RNA Expression by TE Status from RE Report ===\n")
+  cat("Sample type:", sample_type, "\n")
+  cat("Minimum gene mentions:", min_gene_mentions, "\n")
+  cat("Minimum samples per group:", min_samples_per_group, "\n\n")
+
+  # Load RE report
+  cat("Loading RE report from:", re_report_path, "\n")
+  re_data <- fread(re_report_path, header = FALSE)
+
+  # Add column names based on load_and_join_re_data function
+  colnames(re_data) <- c("chr", "start", "end", "ins", "sample", "ID", "ref", "ALT", "x",
+                         "filter", "info", "y", "genotype", "chr_reg", "start_reg", "end_reg",
+                         "type_reg", "gene_reg")
+
+  cat("Loaded", nrow(re_data), "rows from RE report\n")
+
+  # Extract TE type from ALT column (e.g., <INS:ME:ALU> -> ALU)
+  re_data$te_type <- gsub(".*:([^>]+)>", "\\1", re_data$ALT)
+
+  # Create TE coordinates
+  re_data$te_coordinates <- paste0(re_data$chr, ":", re_data$start, "-", re_data$end)
+
+  # Create RE location
+  re_data$te_location <- paste0(re_data$chr_reg, ":", re_data$start_reg, "-", re_data$end_reg)
+
+  # Split gene_reg column (semicolon-separated) into one row per gene
+  cat("\nSplitting gene_reg column...\n")
+  re_split <- re_data %>%
+    separate_rows(gene_reg, sep = ";") %>%
+    filter(!is.na(gene_reg) & gene_reg != "")
+
+  cat("After splitting:", nrow(re_split), "rows\n")
+
+  # Count gene occurrences
+  gene_counts <- re_split %>%
+    count(gene_reg, name = "n_occurrences") %>%
+    filter(n_occurrences >= min_gene_mentions) %>%
+    arrange(desc(n_occurrences))
+
+  cat("\nGenes with >=", min_gene_mentions, "mentions:", nrow(gene_counts), "\n")
+  cat("Top 10 genes by occurrence:\n")
+  print(head(gene_counts, 10))
+
+  if (nrow(gene_counts) == 0) {
+    cat("\nNo genes meet the minimum occurrence threshold.\n")
+    return(data.frame())
+  }
+
+  # Extract sample IDs from ID column
+  # Germline: HS_21-8063-A-02-00_N-1-825009-291-ALU -> HS_21-8063-A-02-00_N
+  # Tumor: 0400_20-1851-A-02-00_T-xtea-1-827186-247-ALU -> 0400_20-1851-A-02-00_T
+  cat("\nExtracting sample IDs from ID column...\n")
+
+  # Pattern: sample_id-[tool]-chr-pos-len-type (tool is optional)
+  # Remove: -[tool]-chr-pos-len-type from the end
+  # Use perl=TRUE for extended regex with optional group
+  re_split$sample_id <- gsub("-([a-z]+-)?[0-9XY]+-[0-9]+-[0-9]+-[A-Z0-9]+$", "", re_split$ID, perl = TRUE)
+
+  cat("Extracted", length(unique(re_split$sample_id)), "unique samples from RE report\n")
+  cat("Example sample IDs (first 5):\n")
+  print(head(unique(re_split$sample_id), 5))
+
+  # Get RNA sample names (excluding gene_name column)
+  rna_samples <- setdiff(colnames(rna_data), "gene_name")
+  cat("\nRNA data:", nrow(rna_data), "genes ×", length(rna_samples), "samples\n")
+
+  # For germline RE report matched to tumor RNA: extract base patient IDs
+  if (sample_type == "germline") {
+    cat("\nMatching germline TE samples to tumor RNA samples by base patient ID...\n")
+
+    # Extract base patient IDs (remove _N or _T suffix)
+    re_base_ids <- unique(sub("_.*", "", re_split$sample_id))
+    rna_base_ids <- sub("_.*", "", rna_samples)
+
+    cat("Unique RE patient IDs:", length(re_base_ids), "\n")
+    cat("Unique RNA patient IDs:", length(unique(rna_base_ids)), "\n")
+
+    # Find overlap
+    common_base_ids <- intersect(re_base_ids, unique(rna_base_ids))
+    cat("Overlapping patient IDs:", length(common_base_ids), "\n")
+
+    # Filter RNA samples to those with germline data
+    matched_rna_samples <- rna_samples[rna_base_ids %in% re_base_ids]
+    cat("Matched RNA samples:", length(matched_rna_samples), "\n")
+
+    # Create mapping from base ID to RNA sample name
+    base_to_rna <- setNames(matched_rna_samples, sub("_.*", "", matched_rna_samples))
+
+  } else {
+    # Tumor: direct matching only (no base ID matching for somatic samples)
+    cat("\nMatching tumor TE samples to tumor RNA samples...\n")
+
+    # Direct matching only
+    matched_rna_samples <- intersect(unique(re_split$sample_id), rna_samples)
+    cat("Matched samples:", length(matched_rna_samples), "\n")
+  }
+
+  # Test each gene
+  results_list <- list()
+
+  cat("\nTesting genes...\n")
+  pb <- txtProgressBar(min = 0, max = nrow(gene_counts), style = 3)
+
+  for (i in 1:nrow(gene_counts)) {
+    setTxtProgressBar(pb, i)
+
+    gene <- gene_counts$gene_reg[i]
+
+    # Check if gene exists in RNA data
+    if (!gene %in% rna_data$gene_name) {
+      next
+    }
+
+    # Get samples with TE affecting this gene
+    samples_with_te <- re_split %>%
+      filter(gene_reg == gene) %>%
+      pull(sample_id) %>%
+      unique()
+
+    # Map to RNA samples
+    if (sample_type == "germline") {
+      # Convert TE sample IDs to base IDs, then to RNA sample names
+      base_ids_with_te <- unique(sub("_.*", "", samples_with_te))
+      rna_samples_with_te <- base_to_rna[base_ids_with_te]
+      rna_samples_with_te <- rna_samples_with_te[!is.na(rna_samples_with_te)]
+    } else {
+      # Tumor: direct matching only (no base ID matching for somatic samples)
+      rna_samples_with_te <- intersect(samples_with_te, matched_rna_samples)
+    }
+
+    # Samples without TE = all matched RNA samples except those with TE
+    rna_samples_without_te <- setdiff(matched_rna_samples, rna_samples_with_te)
+
+    # Check minimum sample size
+    if (length(rna_samples_with_te) < min_samples_per_group ||
+        length(rna_samples_without_te) < min_samples_per_group) {
+      next
+    }
+
+    # Extract RNA expression for this gene
+    gene_expr <- rna_data %>%
+      filter(gene_name == gene) %>%
+      select(-gene_name) %>%
+      unlist()
+
+    expr_with_te <- gene_expr[rna_samples_with_te]
+    expr_without_te <- gene_expr[rna_samples_without_te]
+
+    # Remove zeros and NAs
+    expr_with_te <- expr_with_te[!is.na(expr_with_te) & expr_with_te > 0]
+    expr_without_te <- expr_without_te[!is.na(expr_without_te) & expr_without_te > 0]
+
+    # Recheck sample sizes after filtering
+    if (length(expr_with_te) < min_samples_per_group ||
+        length(expr_without_te) < min_samples_per_group) {
+      next
+    }
+
+    # Calculate statistics
+    median_with <- median(expr_with_te, na.rm = TRUE)
+    median_without <- median(expr_without_te, na.rm = TRUE)
+    mean_with <- mean(expr_with_te, na.rm = TRUE)
+    mean_without <- mean(expr_without_te, na.rm = TRUE)
+
+    # Calculate fold change
+    fold_change <- mean_with / mean_without
+    effect_direction <- ifelse(mean_with > mean_without, "up", "down")
+
+    # Perform Wilcoxon test
+    test_result <- wilcox.test(expr_with_te, expr_without_te, alternative = "two.sided")
+
+    # Get TE-specific information for this gene
+    gene_te_info <- re_split %>%
+      filter(gene_reg == gene) %>%
+      summarise(
+        te_types = paste(unique(te_type), collapse = ";"),
+        te_coords = paste(unique(te_coordinates), collapse = ";"),
+        te_location_types = paste(unique(type_reg), collapse = ";"),
+        te_locations = paste(unique(te_location), collapse = ";"),
+        n_unique_tes = n_distinct(ID)
+      )
+
+    # Store result
+    results_list[[length(results_list) + 1]] <- data.frame(
+      gene = gene,
+      te_type = gene_te_info$te_types,
+      te_coordinates = gene_te_info$te_coords,
+      te_location_type = gene_te_info$te_location_types,
+      te_location = gene_te_info$te_locations,
+      gene_features = "",  # Placeholder for future annotations
+      n_unique_tes = gene_te_info$n_unique_tes,
+      samples_with_te = length(expr_with_te),
+      samples_without_te = length(expr_without_te),
+      median_with_te = median_with,
+      median_without_te = median_without,
+      mean_with_te = mean_with,
+      mean_without_te = mean_without,
+      fold_change = fold_change,
+      effect_direction = effect_direction,
+      p_value = test_result$p.value,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  close(pb)
+
+  # Combine results
+  if (length(results_list) == 0) {
+    cat("\nNo genes could be tested.\n")
+    return(data.frame())
+  }
+
+  results_df <- bind_rows(results_list)
+
+  # Calculate adjusted p-values
+  results_df$p_adj <- p.adjust(results_df$p_value, method = "BH")
+
+  # Sort by p-value
+  results_df <- results_df %>%
+    arrange(p_value)
+
+  cat("\n\nResults summary:\n")
+  cat("Total genes tested:", nrow(results_df), "\n")
+  cat("Significant at p < 0.05:", sum(results_df$p_value < 0.05), "\n")
+  cat("Significant at p_adj < 0.05:", sum(results_df$p_adj < 0.05), "\n")
+  cat("Significant at p_adj < 0.1:", sum(results_df$p_adj < 0.1), "\n")
+
+  if (nrow(results_df) > 0) {
+    cat("\nTop 10 results by p-value:\n")
+    print(results_df[1:min(10, nrow(results_df)), c("gene", "samples_with_te", "samples_without_te",
+                                                      "fold_change", "effect_direction", "p_value", "p_adj")])
+  }
+
+  return(results_df)
+}
