@@ -6,19 +6,26 @@
 #### SETUP ####
 r_dir <- "/Users/briannelaverty/Documents/R_Malkin/te/data/R_obj/tumour/"
 plot_dir <- "/Users/briannelaverty/Library/Mobile Documents/com~apple~CloudDocs/Malkin_lab/figures/te/graphs/tumour/"
-r_dir_files <- "/Users/briannelaverty/Library/Mobile Documents/com~apple~CloudDocs/Malkin_lab/figures/te/graphs/tumour/files/"
+r_dir_files <- paste0(plot_dir, "files/")
 hpc_dir <- "/Users/briannelaverty/Documents/R_Malkin/te/hpc_data/processed/"
+processed_dir <- hpc_dir  # Alias for HPC output directory
 
 # TE type filtering options
 INCLUDE_ALU <- FALSE  # Set to TRUE to include ALU elements
 INCLUDE_SVA <- FALSE  # Set to TRUE to include SVA elements
 
 # Processing options
+PROCESS_COMMON_TES <- TRUE # Set to TRUE to process common TEs (slower)
+PROCESS_FULLLENGTH <- TRUE # Set to TRUE to process full-length LINE1 (≥5900bp)
 GENERATE_FREQUENCY_PLOTS <- FALSE  # Set to TRUE to generate TE frequency distribution and HostSeq filtering plots (slower)
 
 # Pipeline tracking options
 ENABLE_DETAILED_TRACKING <- TRUE # Set to TRUE to enable detailed pipeline tracking (slower)
 
+# Create output directory if it doesn't exist
+if (!dir.exists(r_dir_files)) {
+  dir.create(r_dir_files, recursive = TRUE)
+}
 
 #### LIBRARIES ####
 suppressPackageStartupMessages({
@@ -104,6 +111,11 @@ clinical <- prep_clinical(clinical)
 # Host seq with cancer
 hostseq_cancer <- prep_hostseq(clinical)
 
+# Blood cancer samples
+bloodcancer <- clinical %>%
+  filter(tumor_class == "LEUKEMIA/LYMPHOMA") %>%
+  select(sample) %>%
+  rename(V1 = sample)
 
 # Chromosome length
 chr_length$chr <- factor(chr_length$chr, levels=c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,"X","Y"))
@@ -124,12 +136,7 @@ save(ancestry, file = paste0(r_dir, "ancestry.RData"))
 
 # Merge clinical and ancestry data and save as CSV (tumour version)
 cat("Merging clinical and ancestry data (tumour)...\n")
-clinical_ancestry_t <- merge_dfs(clinical, ancestry, include_all_x = TRUE, print_info = TRUE, dataset_name = "ancestry")
-processed_dir <- "/Users/briannelaverty/Documents/R_Malkin/te/hpc_data/processed/"
-if (!dir.exists(processed_dir)) {
-  dir.create(processed_dir, recursive = TRUE)
-  cat("Created directory:", processed_dir, "\n")
-}
+clinical_ancestry_t <- merge_dfs(clinical, ancestry, include_all_x = FALSE, print_info = FALSE, dataset_name = "ancestry_tumour")
 clinical_ancestry_file_t <- paste0(processed_dir, "clinical_ancestry_tumour.csv")
 write.csv(clinical_ancestry_t, clinical_ancestry_file_t, row.names = FALSE)
 cat("✓ Saved merged clinical and ancestry data (tumour) to:", clinical_ancestry_file_t, "\n")
@@ -154,10 +161,19 @@ cat("========================================\n")
 
 # Always capture and write filter_false_positives output
 filter_fp_stdout_t <- capture.output({
-  te_raw_t <- filter_false_positives(te_raw_t, l1_merge_fp, unique_l1_tp, unique_l1_fp, unique_l1_master)
+  fp_result <- filter_false_positives(te_raw_t, l1_merge_fp, unique_l1_tp, unique_l1_fp, unique_l1_master)
 })
+te_raw_t <- fp_result$te_data
+excluded_unreviewed <- fp_result$excluded_samples
 write_stdout_to_file(filter_fp_stdout_t, paste0(r_dir_files, "/processed_output.txt"),
                      "STDOUT for filter_false_positives", append = TRUE)
+
+# Initialize master exclusion tracker with unreviewed IGV samples
+exclusion_tracker_master <- create_sample_exclusion_tracker()
+if (length(excluded_unreviewed) > 0) {
+  exclusion_tracker_master <- add_to_exclusion_tracker(exclusion_tracker_master, excluded_unreviewed, "unreviewed_igv")
+  cat("Tracked", length(excluded_unreviewed), "unreviewed IGV samples for exclusion\n")
+}
 
 if (ENABLE_DETAILED_TRACKING) {
   # Extract intermediate counts from captured output
@@ -202,12 +218,26 @@ cat("========================================\n")
 
 # Always capture and write prep_te output
 prep_te_stdout_t <- capture.output({
-  te_raw_prepped_t <- prep_te(te_raw_t, nonproband, noconsent, hostseq_cancer, metrics,
-                             c("mean_cov", "avg_quality", "pct_chimeras"), c(20, 28, 2), type="T",
+  prep_result <- prep_te(te_raw_t, nonproband, noconsent, hostseq_cancer, bloodcancer, metrics,
+                             c("mean_cov", "avg_quality", "pct_chimeras"), c(20, 25, 2), type="T",
                              export_filtered = TRUE, output_dir = r_dir_files)
 })
+te_raw_prepped_t <- prep_result$df
+excluded_qc <- prep_result$excluded_samples
+# Collect QC exclusions into master tracker
+if (!is.null(prep_result$exclusion_tracker) && nrow(prep_result$exclusion_tracker) > 0) {
+  exclusion_tracker_master <- rbind(exclusion_tracker_master, prep_result$exclusion_tracker)
+}
 write_stdout_to_file(prep_te_stdout_t, paste0(r_dir_files, "/processed_output.txt"),
                      "STDOUT for prep_te", append = TRUE)
+
+# Remove all excluded samples from complete_samples
+# This prevents filtered samples from being added back as "nohits" in process_te_data_tumour
+all_excluded <- unique(c(excluded_unreviewed, excluded_qc))
+complete_samples_before <- nrow(complete_samples)
+complete_samples <- complete_samples[!(complete_samples$V1 %in% all_excluded), , drop = FALSE]
+cat("Removed", complete_samples_before - nrow(complete_samples),
+    "excluded samples from complete_samples (", nrow(complete_samples), "remaining)\n")
 
 if (ENABLE_DETAILED_TRACKING) {
   step3 <- init_step_tracking(te_raw_prepped_t, "sample")
@@ -313,17 +343,10 @@ if (GENERATE_FREQUENCY_PLOTS) {
     cat("Creating histogram of TEs and their frequency in HostSeq filter group (66%)...\n")
 
     # Combine tumour data with germline filter group
-    # Convert common columns to same type to avoid bind_rows errors
-    te_raw_prepped_t_clean <- te_raw_prepped_t %>%
-      mutate(across(where(is.character) & matches("GC_content|MAPQ"), as.numeric))
-
-    te_germline_filter_clean <- te_germline_filter %>%
-      mutate(across(where(is.character) & matches("GC_content|MAPQ"), as.numeric))
-
-    # Use bind_rows to handle different columns
-    te_with_filter_hostseq <- bind_rows(
-      te_raw_prepped_t_clean,
-      te_germline_filter_clean
+    # Use rbindlist for fast binding with automatic type coercion
+    te_with_filter_hostseq <- as.data.frame(
+      rbindlist(list(as.data.table(te_raw_prepped_t), as.data.table(te_germline_filter)),
+                fill = TRUE, use.names = TRUE)
     )
 
     # Convert to expanded format for this plot
@@ -344,17 +367,13 @@ if (GENERATE_FREQUENCY_PLOTS) {
   cat("Analyzing sensitivity of common TE filtering to HostSeq sample size...\n")
 
   # Combine tumour data with germline HostSeq for sensitivity analysis
-  # Convert common columns to same type
-  te_raw_prepped_t_sens <- te_raw_prepped_t %>%
-    mutate(across(where(is.character) & matches("GC_content|MAPQ"), as.numeric))
-
   te_raw_prepped_hostseq <- te_raw_prepped %>%
-    filter(grepl("^HS_", sample)) %>%
-    mutate(across(where(is.character) & matches("GC_content|MAPQ"), as.numeric))
+    filter(grepl("^HS_", sample))
 
-  te_tumour_with_hostseq <- bind_rows(
-    te_raw_prepped_t_sens,
-    te_raw_prepped_hostseq
+  # Use rbindlist for fast binding with automatic type coercion
+  te_tumour_with_hostseq <- as.data.frame(
+    rbindlist(list(as.data.table(te_raw_prepped_t), as.data.table(te_raw_prepped_hostseq)),
+              fill = TRUE, use.names = TRUE)
   )
 
   sensitivity_plot_t <- analyze_hostseq_filter_sensitivity(
@@ -390,9 +409,16 @@ if (!can_filter_common) {
 process_te_stdout_t <- capture.output({
   final_te_count_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
                                              apply_filter_common = can_filter_common, rare_gnomad = 3, rare_hostseq = 3,
-                                             split_by_gene = FALSE, apply_process_combinations = TRUE, select_samples_split = TRUE, nohits_prefix = "final_te_count_t", nohits_output_dir = r_dir_files)
+                                             split_by_gene = FALSE, apply_process_combinations = TRUE, select_samples_split = TRUE, nohits_prefix = "final_te_count_t", nohits_output_dir = r_dir_files,
+                                             return_exclusion_tracker = TRUE, apply_age_filter = FALSE)
 })
 save(final_te_count_t, file = paste0(r_dir, "final_te_count_rare.RData"))
+
+# Collect age exclusions from process_te_data_tumour
+if (!is.null(final_te_count_t$exclusion_tracker) && nrow(final_te_count_t$exclusion_tracker) > 0) {
+  exclusion_tracker_master <- rbind(exclusion_tracker_master, final_te_count_t$exclusion_tracker)
+  cat("Collected", nrow(final_te_count_t$exclusion_tracker), "additional exclusions from process_te_data_tumour\n")
+}
 
 cat("Writing process_te_data_tumour stdout to processed_output.txt...\n")
 tryCatch({
@@ -421,7 +447,8 @@ if (ENABLE_DETAILED_TRACKING) {
 suppressMessages({
   final_te_count_expand_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
                                                     apply_filter_common = can_filter_common, rare_gnomad = 3, rare_hostseq = 3,
-                                                    split_by_gene = FALSE, apply_process_combinations = FALSE, select_samples_split = TRUE)
+                                                    split_by_gene = FALSE, apply_process_combinations = FALSE, select_samples_split = TRUE,
+                                                    apply_age_filter = FALSE)
 })
 save(final_te_count_expand_t, file = paste0(r_dir, "final_te_count_expand_rare.RData"))
 
@@ -456,28 +483,88 @@ if (ENABLE_DETAILED_TRACKING) {
 # save(final_te_count_expand_split_t, file = paste0(r_dir, "final_te_count_expand_split_rare.RData"))
 
 #### PROCESS COMMON TE DATA ####
-cat("\n========================================\n")
-cat("STEP 5: Processing common TE data\n")
-cat("========================================\n")
-cat("Filtering common TEs (no frequency filters)...\n")
+if (PROCESS_COMMON_TES) {
+  cat("\n========================================\n")
+  cat("STEP 5: Processing common TE data\n")
+  cat("========================================\n")
+  cat("Filtering common TEs (no frequency filters)...\n")
 
-# Common TE: keep common, create count matrix
-final_te_count_common_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry, 
-                                                  apply_filter_common = FALSE, split_by_gene = FALSE, 
-                                                  apply_process_combinations = TRUE, select_samples_split = TRUE, nohits_prefix = "final_te_count_common_t")
-save(final_te_count_common_t, file = paste0(r_dir, "final_te_count_common.RData"))
+  # Common TE: keep common, create count matrix
+  final_te_count_common_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
+                                                    apply_filter_common = FALSE, split_by_gene = FALSE,
+                                                    apply_process_combinations = TRUE, select_samples_split = TRUE, nohits_prefix = "final_te_count_common_t",
+                                                    apply_age_filter = FALSE)
+  save(final_te_count_common_t, file = paste0(r_dir, "final_te_count_common.RData"))
 
-# Common TE: expanded format (one row per full TE, no count matrix)
-final_te_count_expand_common_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry, 
-                                                         apply_filter_common = FALSE, split_by_gene = FALSE, 
-                                                         apply_process_combinations = FALSE, select_samples_split = TRUE)
-save(final_te_count_expand_common_t, file = paste0(r_dir, "final_te_count_expand_common.RData"))
+  # Common TE: expanded format (one row per full TE, no count matrix)
+  final_te_count_expand_common_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
+                                                           apply_filter_common = FALSE, split_by_gene = FALSE,
+                                                           apply_process_combinations = FALSE, select_samples_split = TRUE,
+                                                           apply_age_filter = FALSE)
+  save(final_te_count_expand_common_t, file = paste0(r_dir, "final_te_count_expand_common.RData"))
 
-# Common TE: split by gene format
-final_te_count_expand_split_common_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry, 
-                                                        apply_filter_common = FALSE, split_by_gene = TRUE, 
-                                                        apply_process_combinations = FALSE, select_samples_split = TRUE)
-save(final_te_count_expand_split_common_t, file = paste0(r_dir, "final_te_count_split_common.RData"))
+  # Common TE: split by gene format
+  final_te_count_expand_split_common_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
+                                                          apply_filter_common = FALSE, split_by_gene = TRUE,
+                                                          apply_process_combinations = FALSE, select_samples_split = TRUE,
+                                                          apply_age_filter = FALSE)
+  save(final_te_count_expand_split_common_t, file = paste0(r_dir, "final_te_count_split_common.RData"))
+} else {
+  cat("\n========================================\n")
+  cat("STEP 5: Skipping common TE processing (PROCESS_COMMON_TES = FALSE)\n")
+  cat("========================================\n")
+}
+
+#### PROCESS FULL-LENGTH LINE1 DATA ####
+if (PROCESS_FULLLENGTH) {
+  cat("\n========================================\n")
+  cat("STEP 5B: Processing full-length LINE1 data\n")
+  cat("========================================\n")
+  cat("Filtering for full-length LINE1 (≥5900bp)...\n")
+
+  # Full-length LINE1: count matrix format
+  final_te_count_fulllength_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
+                                             apply_filter_common = FALSE,
+                                             apply_filter_fulllength_young = TRUE,
+                                             fulllength_bp = 5900,
+                                             young_subfamilies = c("L1HS"),
+                                             split_by_gene = FALSE,
+                                             apply_process_combinations = TRUE,
+                                             select_samples_split = TRUE,
+                                             nohits_prefix = "final_te_count_fulllength_t",
+                                             apply_age_filter = FALSE)
+  save(final_te_count_fulllength_t, file = paste0(r_dir, "final_te_count_fulllength.RData"))
+
+  # Full-length LINE1: expanded format (one row per TE)
+  final_te_count_expand_fulllength_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
+                                                    apply_filter_common = FALSE,
+                                                    apply_filter_fulllength_young = TRUE,
+                                                    fulllength_bp = 5900,
+                                                    young_subfamilies = c("L1HS"),
+                                                    split_by_gene = FALSE,
+                                                    apply_process_combinations = FALSE,
+                                                    select_samples_split = TRUE,
+                                                    apply_age_filter = FALSE)
+  save(final_te_count_expand_fulllength_t, file = paste0(r_dir, "final_te_count_expand_fulllength.RData"))
+
+  # Full-length LINE1: gene-split format
+  final_te_count_expand_split_fulllength_t <- process_te_data_tumour(te_raw_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
+                                                         apply_filter_common = FALSE,
+                                                         apply_filter_fulllength_young = TRUE,
+                                                         fulllength_bp = 5900,
+                                                         young_subfamilies = c("L1HS"),
+                                                         split_by_gene = TRUE,
+                                                         apply_process_combinations = FALSE,
+                                                         select_samples_split = TRUE,
+                                                         apply_age_filter = FALSE)
+  save(final_te_count_expand_split_fulllength_t, file = paste0(r_dir, "final_te_count_split_fulllength.RData"))
+
+  cat("Full-length LINE1 data saved.\n")
+} else {
+  cat("\n========================================\n")
+  cat("STEP 5B: Skipping full-length LINE1 processing (PROCESS_FULLLENGTH = FALSE)\n")
+  cat("========================================\n")
+}
 
 #### PROCESS SPLIT TE DATA ####
 cat("\n========================================\n")
@@ -492,19 +579,22 @@ suppressMessages({
 
 # Filter false positives for split data (suppress output)
 suppressMessages({
-  te_split_t <- filter_false_positives(te_split_t, l1_merge_fp, unique_l1_tp, unique_l1_fp, unique_l1_master, check_missing_ids = FALSE)
+  fp_result_split <- filter_false_positives(te_split_t, l1_merge_fp, unique_l1_tp, unique_l1_fp, unique_l1_master, check_missing_ids = FALSE)
+  te_split_t <- fp_result_split$te_data
 })
 
 # Prepare te_split (suppress output)
 suppressMessages({
-  te_split_prepped_t <- prep_te(te_split_t, nonproband, noconsent, hostseq_cancer, metrics,
+  prep_result_split <- prep_te(te_split_t, nonproband, noconsent, hostseq_cancer, bloodcancer, metrics,
                              c("mean_cov", "avg_quality", "pct_chimeras"), c(20, 28, 2), type="T")
+  te_split_prepped_t <- prep_result_split$df
 })
 
 # Split TE data for gene analysis
 final_te_count_expand_split_split_rare_t <- process_te_data_tumour(te_split_prepped_t, te_germline=te_germline_filter, clinical, complete_samples, metrics, ancestry,
                                                        apply_filter_common = can_filter_common, rare_gnomad = 3, rare_hostseq = 3, split_by_gene = TRUE,
-                                                       apply_process_combinations = FALSE, select_samples_split = TRUE)
+                                                       apply_process_combinations = FALSE, select_samples_split = TRUE,
+                                                       apply_age_filter = FALSE)
 save(final_te_count_expand_split_split_rare_t, file = paste0(r_dir, "final_te_count_expand_split_split_rare.RData"))
 
 # Write pipeline summary tables to processed output file
@@ -665,111 +755,77 @@ pipeline_summary <- capture.output({
 
 #### REPLACE HOSTSEQ FILTER GROUP WITH ANALYSIS GROUP ####
 cat("\n========================================\n")
-cat("STEP 5: Replacing HostSeq filter group with analysis group\n")
+cat("STEP 5: Removing HostSeq samples from tumour data\n")
 cat("========================================\n")
 
-# Check if we can do the replacement
-can_replace_hostseq <- !is.null(te_germline_analysis) && nrow(te_germline_analysis) > 0
+# For tumour data, HostSeq samples are only used during processing for common TE filtering.
+# They should be completely removed from final datasets since they have no tumour data
+# and are not used in any downstream tumour analysis.
 
-if (!can_replace_hostseq) {
-  cat("⚠ WARNING: Cannot replace HostSeq filter group - no analysis group available\n")
-  cat("  Skipping HostSeq group replacement step\n\n")
-} else {
-  cat("Swapping HostSeq filter group (66%) with analysis group (33%) for final datasets...\n")
+cat("Removing all HostSeq samples from final tumour datasets...\n")
 
-  # Process rare TE data - all dataframes in final_te_count_t list
-  for (df_name in names(final_te_count_t)) {
-    if (is.data.frame(final_te_count_t[[df_name]])) {
-      final_te_count_t[[df_name]] <- replace_hostseq_with_analysis_group(
-        te_data = final_te_count_t[[df_name]],
-        filter_samples = hostseq_split$filter_samples,
-        te_analysis = te_germline_analysis
-      )
-    }
+# Process rare TE data - all dataframes in final_te_count_t list
+# Skip exclusion_tracker since it's a tracking dataframe, not TE data
+for (df_name in names(final_te_count_t)) {
+  if (df_name != "exclusion_tracker" && is.data.frame(final_te_count_t[[df_name]])) {
+    final_te_count_t[[df_name]] <- remove_hostseq_from_tumour(
+      te_data = final_te_count_t[[df_name]]
+    )
   }
 }
 save(final_te_count_t, file = paste0(r_dir, "final_te_count_rare.RData"))
 
-if (can_replace_hostseq) {
-  # Process rare TE expanded format
-  for (df_name in names(final_te_count_expand_t)) {
-    if (is.data.frame(final_te_count_expand_t[[df_name]])) {
-      final_te_count_expand_t[[df_name]] <- replace_hostseq_with_analysis_group(
-        te_data = final_te_count_expand_t[[df_name]],
-        filter_samples = hostseq_split$filter_samples,
-        te_analysis = te_germline_analysis
-      )
-    }
+# Process rare TE expanded format
+for (df_name in names(final_te_count_expand_t)) {
+  if (is.data.frame(final_te_count_expand_t[[df_name]])) {
+    final_te_count_expand_t[[df_name]] <- remove_hostseq_from_tumour(
+      te_data = final_te_count_expand_t[[df_name]]
+    )
   }
 }
 save(final_te_count_expand_t, file = paste0(r_dir, "final_te_count_expand_rare.RData"))
 
-if (can_replace_hostseq) {
-  # Process split TE data
-  for (df_name in names(final_te_count_expand_split_split_rare_t)) {
-    if (is.data.frame(final_te_count_expand_split_split_rare_t[[df_name]])) {
-      # For split data, we need to use te_split_prepped with analysis group
-      te_split_analysis_t <- te_split_prepped_t %>%
-        filter(!sample %in% hostseq_split$filter_samples)
-
-      final_te_count_expand_split_split_rare_t[[df_name]] <- replace_hostseq_with_analysis_group(
-        te_data = final_te_count_expand_split_split_rare_t[[df_name]],
-        filter_samples = hostseq_split$filter_samples,
-        te_analysis = te_split_analysis_t
-      )
-    }
+# Process split TE data
+for (df_name in names(final_te_count_expand_split_split_rare_t)) {
+  if (is.data.frame(final_te_count_expand_split_split_rare_t[[df_name]])) {
+    final_te_count_expand_split_split_rare_t[[df_name]] <- remove_hostseq_from_tumour(
+      te_data = final_te_count_expand_split_split_rare_t[[df_name]]
+    )
   }
 }
 save(final_te_count_expand_split_split_rare_t, file = paste0(r_dir, "final_te_count_expand_split_split_rare.RData"))
 
-if (can_replace_hostseq) {
+if (PROCESS_COMMON_TES) {
   # Process common TE data
   for (df_name in names(final_te_count_common_t)) {
     if (is.data.frame(final_te_count_common_t[[df_name]])) {
-      final_te_count_common_t[[df_name]] <- replace_hostseq_with_analysis_group(
-        te_data = final_te_count_common_t[[df_name]],
-        filter_samples = hostseq_split$filter_samples,
-        te_analysis = te_germline_analysis
+      final_te_count_common_t[[df_name]] <- remove_hostseq_from_tumour(
+        te_data = final_te_count_common_t[[df_name]]
       )
     }
   }
-}
-save(final_te_count_common_t, file = paste0(r_dir, "final_te_count_common.RData"))
+  save(final_te_count_common_t, file = paste0(r_dir, "final_te_count_common.RData"))
 
-if (can_replace_hostseq) {
   for (df_name in names(final_te_count_expand_common_t)) {
     if (is.data.frame(final_te_count_expand_common_t[[df_name]])) {
-      final_te_count_expand_common_t[[df_name]] <- replace_hostseq_with_analysis_group(
-        te_data = final_te_count_expand_common_t[[df_name]],
-        filter_samples = hostseq_split$filter_samples,
-        te_analysis = te_germline_analysis
+      final_te_count_expand_common_t[[df_name]] <- remove_hostseq_from_tumour(
+        te_data = final_te_count_expand_common_t[[df_name]]
       )
     }
   }
-}
-save(final_te_count_expand_common_t, file = paste0(r_dir, "final_te_count_expand_common.RData"))
+  save(final_te_count_expand_common_t, file = paste0(r_dir, "final_te_count_expand_common.RData"))
 
-if (can_replace_hostseq) {
   for (df_name in names(final_te_count_expand_split_common_t)) {
     if (is.data.frame(final_te_count_expand_split_common_t[[df_name]])) {
-      te_split_analysis_t <- te_split_prepped_t %>%
-        filter(!sample %in% hostseq_split$filter_samples)
-
-      final_te_count_expand_split_common_t[[df_name]] <- replace_hostseq_with_analysis_group(
-        te_data = final_te_count_expand_split_common_t[[df_name]],
-        filter_samples = hostseq_split$filter_samples,
-        te_analysis = te_split_analysis_t
+      final_te_count_expand_split_common_t[[df_name]] <- remove_hostseq_from_tumour(
+        te_data = final_te_count_expand_split_common_t[[df_name]]
       )
     }
   }
+  save(final_te_count_expand_split_common_t, file = paste0(r_dir, "final_te_count_split_common.RData"))
 }
-save(final_te_count_expand_split_common_t, file = paste0(r_dir, "final_te_count_split_common.RData"))
 
-if (can_replace_hostseq) {
-  cat("✓ All datasets updated with analysis group HostSeq samples\n")
-} else {
-  cat("✓ Datasets saved without HostSeq replacement\n")
-}
+cat("✓ All HostSeq samples removed from tumour datasets\n")
 
 #### EXPORT CSV FILES ####
 cat("\n========================================\n")
@@ -785,36 +841,36 @@ cat("Exporting to HPC directory...\n")
 cat("========================================\n")
 
 # Export split format (one row per TE-gene overlap)
-cat("\nExporting split format files...\n")
-write.csv(final_te_count_expand_split_split_rare_t$te_aff_selected, paste0(hpc_dir, "te_aff_split_t.csv"), row.names = FALSE, quote = FALSE)
+cat("\nExporting split format files (excluding INFO, sample_topography, po_*, P_* columns)...\n")
+write.csv(final_te_count_expand_split_split_rare_t$te_aff_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_split_t.csv"), row.names = FALSE, quote = FALSE)
 cat("✓ Exported split format files\n")
 
 # Export count matrix format (one row per sample with TE counts)
-cat("\nExporting count matrix format files...\n")
-write.csv(final_te_count_t$te_all_selected, paste0(hpc_dir, "te_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_t$te_aff_selected, paste0(hpc_dir, "te_aff_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_t$te_lfs_selected, paste0(hpc_dir, "te_lfs_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_t$te_kics_selected, paste0(hpc_dir, "te_kics_t.csv"), row.names = FALSE, quote = FALSE)
+cat("\nExporting count matrix format files (excluding INFO, sample_topography, po_*, P_* columns)...\n")
+write.csv(final_te_count_t$te_all_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_aff_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_lfs_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_kics_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_t.csv"), row.names = FALSE, quote = FALSE)
 
 # Also export "all" versions (all samples, not just selected)
-write.csv(final_te_count_t$te_all_all, paste0(hpc_dir, "te_all_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_t$te_aff_all, paste0(hpc_dir, "te_aff_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_t$te_lfs_all, paste0(hpc_dir, "te_lfs_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_t$te_kics_all, paste0(hpc_dir, "te_kics_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_all_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_aff_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_lfs_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_t$te_kics_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_all_t.csv"), row.names = FALSE, quote = FALSE)
 cat("✓ Exported count matrix format files\n")
 
 # Export expand format (one row per complete TE insertion)
-cat("\nExporting expand format files...\n")
-write.csv(final_te_count_expand_t$te_all_selected, paste0(hpc_dir, "te_all_expand_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_t$te_aff_selected, paste0(hpc_dir, "te_aff_expand_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_t$te_lfs_selected, paste0(hpc_dir, "te_lfs_expand_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_t$te_kics_selected, paste0(hpc_dir, "te_kics_expand_t.csv"), row.names = FALSE, quote = FALSE)
+cat("\nExporting expand format files (excluding INFO, sample_topography, po_*, P_* columns)...\n")
+write.csv(final_te_count_expand_t$te_all_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all_expand_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_aff_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_expand_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_lfs_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_expand_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_kics_selected %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_expand_t.csv"), row.names = FALSE, quote = FALSE)
 
 # Also export "all" versions (all samples, not just selected)
-write.csv(final_te_count_expand_t$te_all_all, paste0(hpc_dir, "te_all_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_t$te_aff_all, paste0(hpc_dir, "te_aff_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_t$te_lfs_all, paste0(hpc_dir, "te_lfs_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_t$te_kics_all, paste0(hpc_dir, "te_kics_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_all_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_aff_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_lfs_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
+write.csv(final_te_count_expand_t$te_kics_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_expand_all_t.csv"), row.names = FALSE, quote = FALSE)
 cat("✓ Exported expand format files\n")
 
 # Load nohits from R_obj directory and save to HPC directory
@@ -824,6 +880,28 @@ write.table(nohits, paste0(hpc_dir, "nohits_te_aff_t.csv"), row.names = FALSE, c
 cat("✓ Exported nohits samples\n")
 
 cat("\n✓ All files exported to HPC directory:", hpc_dir, "\n")
+
+#### EXPORT EXCLUDED SAMPLES TRACKING ####
+cat("\n========================================\n")
+cat("Exporting excluded samples tracking\n")
+cat("========================================\n")
+
+if (nrow(exclusion_tracker_master) > 0) {
+  # Write excluded samples to CSV
+  exclusion_output_file <- paste0(r_dir_files, "excluded_samples_tumour.csv")
+  write.csv(exclusion_tracker_master, exclusion_output_file, row.names = FALSE)
+  cat("✓ Exported", nrow(exclusion_tracker_master), "excluded sample records to:", exclusion_output_file, "\n")
+
+  # Print summary by exclusion reason
+  cat("\nExclusion summary:\n")
+  exclusion_summary <- table(exclusion_tracker_master$exclusion_reason)
+  for (reason in names(exclusion_summary)) {
+    cat("  •", reason, ":", exclusion_summary[reason], "samples\n")
+  }
+  cat("\n")
+} else {
+  cat("No samples were excluded during processing\n\n")
+}
 
 cat("\n========================================\n")
 cat("PROCESSING COMPLETE\n")
@@ -852,6 +930,7 @@ cat("  • Common TEs (count matrix): final_te_count_common.RData\n")
 cat("  • Common TEs (expanded): final_te_count_expand_common.RData\n")
 cat("  • Gene-split data: final_te_count_*_split*.RData\n")
 cat("  • Clinical/metrics: clinical.RData, metrics.RData, gene_size.RData\n")
+cat("  • Excluded samples tracking: excluded_samples_tumour.csv\n")
 cat("  • CSV exports: te_aff_t.csv, te_all_all_t.csv\n\n")
 
 if (ENABLE_DETAILED_TRACKING) {

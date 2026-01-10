@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("count_matrix", "expand", "split", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_germline.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "taylor/"), "TAYLOR")
 
 cat("Running 02_te_viz_germline_10_taylor.R...\n")
 
@@ -60,27 +64,112 @@ for (i in seq_along(types)) {
          plot = p, width = 10, height = 6)
 }
 
-#### ANALYSIS 5: SPECIFIC TEs BY TUMOR TYPE SUBCLASS ####
+#### ANALYSIS 5: SPECIFIC TEs BY TUMOR TYPE SUBCLASS (MULTI-GROUP) ####
 cat("\n===== ANALYSIS 5: SPECIFIC TEs BY TUMOR TYPE SUBCLASS =====\n")
 
-tryCatch({
-  for (min_samples in c(3, 5)) {
-    cat("\n--- Testing with min_samples =", min_samples, "---\n")
-    te_specific_taylor_subclass <- test_specific_tes_by_group(
-      te_expand = te_taylor_expand,
-      te_count = te_taylor,
-      group_column = "tumor_type_subclass",
-      min_samples_with = min_samples,
-      min_samples_without = min_samples,
-      output_dir = r_dir_files,
-      output_prefix = paste0("specific_tes_taylor_subclass_min", min_samples)
-    )
+# Get subtypes
+subtypes <- unique(na.omit(te_taylor$tumor_type_subclass))
+cat("Found", length(subtypes), "tumor subtypes:", paste(subtypes, collapse = ", "), "\n")
 
-    if (!is.null(te_specific_taylor_subclass) && nrow(te_specific_taylor_subclass$full_results) > 0) {
-      cat("Found", nrow(te_specific_taylor_subclass$significant_tes),
-          "significant TEs at min_samples =", min_samples, "\n")
-      write_output(quote(head(te_specific_taylor_subclass$full_results, 10)),
-                  paste0("Top 10 TEs by subclass (min_samples=", min_samples, ")"))
+tryCatch({
+  # Test by insertion (fullins) using multi-group approach
+  cat("\n--- Testing BY INSERTION (fullins) ---\n")
+  for (min_samples in c(3, 5)) {
+    for (p_thresh in c(0.05, 0.1)) {
+      cat("\n--- Testing with min_samples =", min_samples, ", p_threshold =", p_thresh, "---\n")
+
+      # Only save chi file on first p_thresh (chi results don't change with p_thresh)
+      save_chi <- (p_thresh == 0.05)
+
+      te_specific_taylor_subclass <- test_specific_tes_multigroup(
+        te_expand = te_taylor_expand,
+        te_count = te_taylor,
+        group_column = "tumor_type_subclass",
+        min_samples_with = min_samples,
+        p_threshold_stage1 = p_thresh,
+        output_dir = paste0(plot_dir, "taylor/"),
+        output_prefix = paste0("specific_tes_taylor_subclass_fullins_min", min_samples),
+        save_chi = save_chi,
+        pairwise_suffix = paste0("_p", p_thresh)
+      )
+
+      if (!is.null(te_specific_taylor_subclass)) {
+        cat("Stage 1 (chi-square): Found", te_specific_taylor_subclass$n_stage1_significant,
+            "TEs with subtype association (p <", p_thresh, ")\n")
+        if (!is.null(te_specific_taylor_subclass$pairwise_results)) {
+          cat("Stage 2 (pairwise): Tested", nrow(te_specific_taylor_subclass$pairwise_results),
+              "pairwise comparisons\n")
+        }
+
+        if (save_chi && te_specific_taylor_subclass$n_stage1_significant > 0) {
+          write_output(quote(head(te_specific_taylor_subclass$chi_results, 10)),
+                      paste0("Top 10 TEs by subclass chi-square (min_samples=", min_samples, ")"))
+        }
+      }
+    }
+  }
+
+  # Test by gene (all genes)
+  cat("\n--- Testing BY GENE (all genes) ---\n")
+  for (min_samples in c(3, 5)) {
+    for (p_thresh in c(0.05, 0.1)) {
+      cat("\n--- Testing with min_samples =", min_samples, ", p_threshold =", p_thresh, "---\n")
+
+      save_chi <- (p_thresh == 0.05)
+
+      te_specific_by_gene_taylor <- test_specific_tes_by_gene_multigroup(
+        te_expand = te_taylor_split,
+        te_count = te_taylor,
+        group_column = "tumor_type_subclass",
+        min_samples_with = min_samples,
+        p_threshold_stage1 = p_thresh,
+        gene_filter = NULL,
+        output_dir = paste0(plot_dir, "taylor/"),
+        output_prefix = paste0("specific_tes_taylor_subclass_gene_min", min_samples),
+        save_chi = save_chi,
+        pairwise_suffix = paste0("_p", p_thresh)
+      )
+
+      if (!is.null(te_specific_by_gene_taylor)) {
+        cat("Stage 1: Found", te_specific_by_gene_taylor$n_stage1_significant,
+            "genes with subtype association (p <", p_thresh, ")\n")
+        if (!is.null(te_specific_by_gene_taylor$pairwise_results)) {
+          cat("Stage 2: Tested", nrow(te_specific_by_gene_taylor$pairwise_results),
+              "pairwise comparisons\n")
+        }
+      }
+    }
+  }
+
+  # Test by gene (cancer genes only)
+  cat("\n--- Testing BY GENE (cancer genes only) ---\n")
+  for (min_samples in c(3, 5)) {
+    for (p_thresh in c(0.05, 0.1)) {
+      cat("\n--- Testing with min_samples =", min_samples, ", p_threshold =", p_thresh, "---\n")
+
+      save_chi <- (p_thresh == 0.05)
+
+      te_specific_by_gene_cancer_taylor <- test_specific_tes_by_gene_multigroup(
+        te_expand = te_taylor_split,
+        te_count = te_taylor,
+        group_column = "tumor_type_subclass",
+        min_samples_with = min_samples,
+        p_threshold_stage1 = p_thresh,
+        gene_filter = genes,
+        output_dir = paste0(plot_dir, "taylor/"),
+        output_prefix = paste0("specific_tes_taylor_subclass_cancergene_min", min_samples),
+        save_chi = save_chi,
+        pairwise_suffix = paste0("_p", p_thresh)
+      )
+
+      if (!is.null(te_specific_by_gene_cancer_taylor)) {
+        cat("Stage 1: Found", te_specific_by_gene_cancer_taylor$n_stage1_significant,
+            "cancer genes with subtype association (p <", p_thresh, ")\n")
+        if (!is.null(te_specific_by_gene_cancer_taylor$pairwise_results)) {
+          cat("Stage 2: Tested", nrow(te_specific_by_gene_cancer_taylor$pairwise_results),
+              "pairwise comparisons\n")
+        }
+      }
     }
   }
 }, error = function(e) {
@@ -119,7 +208,7 @@ tryCatch({
 
   # Save to file
   write.csv(te_taylor_cancergenes,
-           paste0(r_dir_files, "taylor_cancer_genes_per_sample.csv"),
+           paste0(plot_dir, "taylor/taylor_cancer_genes_per_sample.csv"),
            row.names = FALSE)
 
   # Test by tumor type subclass
@@ -177,11 +266,11 @@ tryCatch({
 cat("\n===== ANALYSIS 10: FULL-LENGTH LINE1 ANALYSIS =====\n")
 
 tryCatch({
-  # Identify full-length LINE1 (>6000 bp)
+  # Identify full-length LINE1 (>=5900 bp)
   te_taylor_expand_line_fulllength <- te_taylor_expand %>%
-    filter(ALT == "LINE1" & SV_length > 6000)
+    filter(ALT == "LINE1" & SV_length >= 5900)
 
-  cat("Full-length LINE1 insertions (>6kb):", nrow(te_taylor_expand_line_fulllength), "\n")
+  cat("Full-length LINE1 insertions (>=5900bp):", nrow(te_taylor_expand_line_fulllength), "\n")
 
   if (nrow(te_taylor_expand_line_fulllength) > 0) {
     # Count per sample
@@ -207,7 +296,7 @@ tryCatch({
 
     # Save full-length LINE1 data
     write.csv(te_taylor_expand_line_fulllength,
-             paste0(r_dir_files, "taylor_fulllength_line1.csv"),
+             paste0(plot_dir, "taylor/taylor_fulllength_line1.csv"),
              row.names = FALSE)
   }
 }, error = function(e) {
@@ -228,7 +317,7 @@ tryCatch({
 
   # Save to file
   write.csv(chr_dist,
-           paste0(r_dir_files, "taylor_chr_distribution_by_subclass.csv"),
+           paste0(plot_dir, "taylor/taylor_chr_distribution_by_subclass.csv"),
            row.names = FALSE)
 
   # Chi-square test for non-random distribution (if enough samples)
@@ -252,19 +341,45 @@ tryCatch({
 #### ANALYSIS 2: RE (REGULATORY ELEMENT) ANALYSIS - PUT LAST ####
 cat("\n===== ANALYSIS 2: RE ANALYSIS =====\n")
 
+#### PARAMETER SWEEP CONFIGURATION FOR RE PATHWAY ANALYSIS ####
+cat("\n*** TAYLOR RE PATHWAY ANALYSIS ***\n")
+param_grid_re_pathway_taylor <- expand.grid(
+  min_genes_per_group = c(5),
+  p_pathway = c(0.05),
+  q_pathway = c(0.1),
+  stringsAsFactors = FALSE
+)
+cat("Testing", nrow(param_grid_re_pathway_taylor), "parameter combinations\n\n")
+
+# Load RE data once (outside the parameter loop)
+cat("Loading RE data for Taylor cohort...\n")
+te_taylor_re <- load_and_join_re_data(te_taylor_expand, re_germline_path)
+te_taylor_re_split <- split_re_genes(te_taylor_re)
+
+cat("Taylor RE data loaded:\n")
+cat("  Samples with RE overlaps:", length(unique(te_taylor_re_split$sample.x)), "\n")
+cat("  Genes in REs:", length(unique(te_taylor_re_split$gene_reg)), "\n")
+
+# Loop through parameter combinations
+for (param_idx in 1:nrow(param_grid_re_pathway_taylor)) {
+  params_re_taylor <- param_grid_re_pathway_taylor[param_idx, ]
+
+  # Create parameter suffix for filenames
+  param_suffix_taylor <- paste0(
+    "_min", params_re_taylor$min_genes_per_group,
+    "_ppathway", params_re_taylor$p_pathway,
+    "_qpathway", params_re_taylor$q_pathway
+  )
+
+  cat("\n\n===== TESTING TAYLOR RE PATHWAY PARAMETERS", param_idx, "/", nrow(param_grid_re_pathway_taylor), "=====\n")
+  cat("min_genes_per_group =", params_re_taylor$min_genes_per_group,
+      ", p_pathway =", params_re_taylor$p_pathway,
+      ", q_pathway =", params_re_taylor$q_pathway, "\n")
+
 #### ANALYSIS 2a: RE BY TUMOR TYPE SUBCLASS (WITHIN TAYLOR) ####
 cat("\n=== Analysis 2a: RE by Tumor Type Subclass (within Taylor) ===\n")
 
 tryCatch({
-  # Load and join RE data for Taylor cohort
-  cat("Loading RE data for Taylor cohort...\n")
-  te_taylor_re <- load_and_join_re_data(te_taylor_expand, re_germline_path)
-  te_taylor_re_split <- split_re_genes(te_taylor_re)
-
-  cat("Taylor RE data loaded:\n")
-  cat("  Samples with RE overlaps:", length(unique(te_taylor_re_split$sample.x)), "\n")
-  cat("  Genes in REs:", length(unique(te_taylor_re_split$gene_reg)), "\n")
-
   # Group genes by tumor_type_subclass
   geneClusters_taylor_subclass <- lapply(
     split(te_taylor_re_split$gene_reg, te_taylor_re_split$tumor_type_subclass),
@@ -278,7 +393,7 @@ tryCatch({
 
   # Run compareCluster pathway analysis
   if (length(geneClusters_taylor_subclass) > 1 &&
-      all(sapply(geneClusters_taylor_subclass, length) >= 5)) {
+      all(sapply(geneClusters_taylor_subclass, length) >= params_re_taylor$min_genes_per_group)) {
 
     ora_re_taylor_subclass <- tryCatch({
       compareCluster(
@@ -288,8 +403,8 @@ tryCatch({
         keyType = "SYMBOL",
         ont = "BP",
         pAdjustMethod = "BH",
-        pvalueCutoff = 0.05,
-        qvalueCutoff = 0.1
+        pvalueCutoff = params_re_taylor$p_pathway,
+        qvalueCutoff = params_re_taylor$q_pathway
       )
     }, error = function(e) {
       cat("Error in pathway analysis:", e$message, "\n")
@@ -302,37 +417,73 @@ tryCatch({
 
       # Save results
       write.csv(as.data.frame(ora_re_taylor_subclass),
-               paste0(r_dir_files, "re_pathway_taylor_subclass.csv"),
+               paste0(plot_dir, "taylor/re_pathway_taylor_subclass", param_suffix_taylor, ".csv"),
                row.names = FALSE)
 
       # Create plots
       tryCatch({
         p_dot <- dotplot(ora_re_taylor_subclass, showCategory = 10)
-        titled_print(p_dot, "RE Pathway Dotplot - Taylor by Tumor Subclass")
-        ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_dot.png"),
-               plot = p_dot, width = 14, height = 9)
+        titled_print(p_dot, paste0("RE Pathway Dotplot - Taylor by Tumor Subclass ", param_suffix_taylor))
+        ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_dot", param_suffix_taylor, ".png"),
+               plot = p_dot, width = 18, height = 12)
       }, error = function(e) cat("Warning: Could not create dotplot:", e$message, "\n"))
 
       tryCatch({
         p_cnet <- cnetplot(ora_re_taylor_subclass, showCategory = 5,
                           colorEdge = TRUE, node_label = "category")
-        titled_print(p_cnet, "RE Pathway Cnetplot - Taylor by Tumor Subclass")
-        ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_cnet.png"),
+        titled_print(p_cnet, paste0("RE Pathway Cnetplot - Taylor by Tumor Subclass ", param_suffix_taylor))
+        ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_cnet", param_suffix_taylor, ".png"),
                plot = p_cnet, width = 14, height = 9)
       }, error = function(e) cat("Warning: Could not create cnetplot:", e$message, "\n"))
 
       tryCatch({
         ora_re_taylor_pairwise <- pairwise_termsim(ora_re_taylor_subclass)
         p_emap <- emapplot(ora_re_taylor_pairwise, showCategory = 20)
-        titled_print(p_emap, "RE Pathway Emapplot - Taylor by Tumor Subclass")
-        ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_emap.png"),
+        titled_print(p_emap, paste0("RE Pathway Emapplot - Taylor by Tumor Subclass ", param_suffix_taylor))
+        ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_emap", param_suffix_taylor, ".png"),
                plot = p_emap, width = 14, height = 9)
       }, error = function(e) cat("Warning: Could not create emapplot:", e$message, "\n"))
+
+      # Simplified pathway plots
+      cat("\nCreating simplified pathway plots...\n")
+      ora_re_taylor_subclass_simple <- simplify(ora_re_taylor_subclass, cutoff=0.7, by="p.adjust", select_fun=min)
+      write.csv(as.data.frame(ora_re_taylor_subclass_simple),
+               paste0(plot_dir, "taylor/re_pathway_taylor_subclass_simple", param_suffix_taylor, ".csv"),
+               row.names = FALSE)
+
+      if (!is.null(ora_re_taylor_subclass_simple) && nrow(as.data.frame(ora_re_taylor_subclass_simple)) > 0) {
+        cat("✓ Simplified to", nrow(as.data.frame(ora_re_taylor_subclass_simple)), "pathways\n")
+
+        tryCatch({
+          p_dot_simple <- dotplot(ora_re_taylor_subclass_simple, showCategory = 10)
+          titled_print(p_dot_simple, paste0("RE Pathway Dotplot (Simplified) - Taylor by Tumor Subclass ", param_suffix_taylor))
+          ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_dot_simplified", param_suffix_taylor, ".png"),
+                 plot = p_dot_simple, width = 18, height = 12)
+        }, error = function(e) cat("Warning: Could not create simplified dotplot:", e$message, "\n"))
+
+        tryCatch({
+          p_cnet_simple <- cnetplot(ora_re_taylor_subclass_simple, showCategory = 5,
+                                   colorEdge = TRUE, node_label = "category")
+          titled_print(p_cnet_simple, paste0("RE Pathway Cnetplot (Simplified) - Taylor by Tumor Subclass ", param_suffix_taylor))
+          ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_cnet_simplified", param_suffix_taylor, ".png"),
+                 plot = p_cnet_simple, width = 14, height = 9)
+        }, error = function(e) cat("Warning: Could not create simplified cnetplot:", e$message, "\n"))
+
+        tryCatch({
+          ora_re_taylor_simple_pairwise <- pairwise_termsim(ora_re_taylor_subclass_simple)
+          p_emap_simple <- emapplot(ora_re_taylor_simple_pairwise, showCategory = 20)
+          titled_print(p_emap_simple, paste0("RE Pathway Emapplot (Simplified) - Taylor by Tumor Subclass ", param_suffix_taylor))
+          ggsave(paste0(plot_dir, "taylor/re_pathway_subclass_emap_simplified", param_suffix_taylor, ".png"),
+                 plot = p_emap_simple, width = 14, height = 9)
+        }, error = function(e) cat("Warning: Could not create simplified emapplot:", e$message, "\n"))
+      } else {
+        cat("No pathways remained after simplification\n")
+      }
     } else {
       cat("No significant pathways found for tumor subclass comparison\n")
     }
   } else {
-    cat("Not enough genes per subclass for pathway analysis (minimum 5 required)\n")
+    cat("Not enough genes per subclass for pathway analysis (minimum", params_re_taylor$min_genes_per_group, "required)\n")
   }
 }, error = function(e) {
   cat("Warning: Could not perform RE analysis by tumor subclass:", e$message, "\n")
@@ -349,12 +500,13 @@ tryCatch({
   }
 
   # Add cohort labels
-  te_taylor_re_split$cohort <- "Taylor"
+  te_taylor_re_split_cohort <- te_taylor_re_split
+  te_taylor_re_split_cohort$cohort <- "Taylor"
   te_kics_hostseq_re_split$cohort <- te_kics_hostseq_re_split$cohort  # Already has cohort column
 
   # Combine all three
   te_all_cohorts_re <- rbind(
-    te_taylor_re_split %>% select(gene_reg, cohort),
+    te_taylor_re_split_cohort %>% select(gene_reg, cohort),
     te_kics_hostseq_re_split %>% select(gene_reg, cohort)
   )
 
@@ -370,7 +522,7 @@ tryCatch({
   }
 
   # Run compareCluster for cohort comparison
-  if (all(sapply(geneClusters_cohort, length) >= 5)) {
+  if (all(sapply(geneClusters_cohort, length) >= params_re_taylor$min_genes_per_group)) {
     ora_re_cohort_comparison <- tryCatch({
       compareCluster(
         geneCluster = geneClusters_cohort,
@@ -379,8 +531,8 @@ tryCatch({
         keyType = "SYMBOL",
         ont = "BP",
         pAdjustMethod = "BH",
-        pvalueCutoff = 0.05,
-        qvalueCutoff = 0.1
+        pvalueCutoff = params_re_taylor$p_pathway,
+        qvalueCutoff = params_re_taylor$q_pathway
       )
     }, error = function(e) {
       cat("Error in cohort comparison:", e$message, "\n")
@@ -393,7 +545,7 @@ tryCatch({
 
       # Save results
       write.csv(as.data.frame(ora_re_cohort_comparison),
-               paste0(r_dir_files, "re_pathway_cohort_comparison.csv"),
+               paste0(plot_dir, "taylor/re_pathway_cohort_comparison", param_suffix_taylor, ".csv"),
                row.names = FALSE)
 
       # Identify unique pathways per cohort
@@ -412,41 +564,98 @@ tryCatch({
 
       # Save unique pathways
       write.csv(taylor_unique,
-               paste0(r_dir_files, "re_pathway_taylor_unique.csv"),
+               paste0(plot_dir, "taylor/re_pathway_taylor_unique", param_suffix_taylor, ".csv"),
                row.names = FALSE)
 
       # Create comparison plots
       tryCatch({
         p_dot_cohort <- dotplot(ora_re_cohort_comparison, showCategory = 10)
-        titled_print(p_dot_cohort, "RE Pathway Dotplot - Taylor vs KICS vs HostSeq")
-        ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_dot.png"),
-               plot = p_dot_cohort, width = 14, height = 9)
+        titled_print(p_dot_cohort, paste0("RE Pathway Dotplot - Taylor vs KICS vs HostSeq ", param_suffix_taylor))
+        ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_dot", param_suffix_taylor, ".png"),
+               plot = p_dot_cohort, width = 18, height = 12)
       }, error = function(e) cat("Warning: Could not create cohort dotplot:", e$message, "\n"))
 
       tryCatch({
         p_cnet_cohort <- cnetplot(ora_re_cohort_comparison, showCategory = 5,
                                   colorEdge = TRUE, node_label = "category")
-        titled_print(p_cnet_cohort, "RE Pathway Cnetplot - Taylor vs KICS vs HostSeq")
-        ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_cnet.png"),
+        titled_print(p_cnet_cohort, paste0("RE Pathway Cnetplot - Taylor vs KICS vs HostSeq ", param_suffix_taylor))
+        ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_cnet", param_suffix_taylor, ".png"),
                plot = p_cnet_cohort, width = 14, height = 9)
       }, error = function(e) cat("Warning: Could not create cohort cnetplot:", e$message, "\n"))
 
       tryCatch({
         ora_re_cohort_pairwise <- pairwise_termsim(ora_re_cohort_comparison)
         p_emap_cohort <- emapplot(ora_re_cohort_pairwise, showCategory = 20)
-        titled_print(p_emap_cohort, "RE Pathway Emapplot - Taylor vs KICS vs HostSeq")
-        ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_emap.png"),
+        titled_print(p_emap_cohort, paste0("RE Pathway Emapplot - Taylor vs KICS vs HostSeq ", param_suffix_taylor))
+        ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_emap", param_suffix_taylor, ".png"),
                plot = p_emap_cohort, width = 14, height = 9)
       }, error = function(e) cat("Warning: Could not create cohort emapplot:", e$message, "\n"))
+
+      # Simplified pathway plots
+      cat("\nCreating simplified pathway plots...\n")
+      ora_re_cohort_comparison_simple <- simplify(ora_re_cohort_comparison, cutoff=0.7, by="p.adjust", select_fun=min)
+      write.csv(as.data.frame(ora_re_cohort_comparison_simple),
+               paste0(plot_dir, "taylor/re_pathway_cohort_comparison_simple", param_suffix_taylor, ".csv"),
+               row.names = FALSE)
+
+      if (!is.null(ora_re_cohort_comparison_simple) && nrow(as.data.frame(ora_re_cohort_comparison_simple)) > 0) {
+        cat("✓ Simplified to", nrow(as.data.frame(ora_re_cohort_comparison_simple)), "pathways\n")
+
+        # Identify unique pathways per cohort in simplified results
+        ora_df_simple <- as.data.frame(ora_re_cohort_comparison_simple)
+        taylor_unique_simple <- ora_df_simple %>%
+          filter(Cluster == "Taylor" & !Description %in% ora_df_simple$Description[ora_df_simple$Cluster != "Taylor"])
+        kics_unique_simple <- ora_df_simple %>%
+          filter(Cluster == "KICS" & !Description %in% ora_df_simple$Description[ora_df_simple$Cluster != "KICS"])
+        hostseq_unique_simple <- ora_df_simple %>%
+          filter(Cluster == "HostSeq" & !Description %in% ora_df_simple$Description[ora_df_simple$Cluster != "HostSeq"])
+
+        cat("\nUnique pathways per cohort (simplified):\n")
+        cat("  Taylor:", nrow(taylor_unique_simple), "\n")
+        cat("  KICS:", nrow(kics_unique_simple), "\n")
+        cat("  HostSeq:", nrow(hostseq_unique_simple), "\n")
+
+        # Save unique pathways from simplified results
+        write.csv(taylor_unique_simple,
+                 paste0(plot_dir, "taylor/re_pathway_taylor_unique_simple", param_suffix_taylor, ".csv"),
+                 row.names = FALSE)
+
+        tryCatch({
+          p_dot_cohort_simple <- dotplot(ora_re_cohort_comparison_simple, showCategory = 10)
+          titled_print(p_dot_cohort_simple, paste0("RE Pathway Dotplot (Simplified) - Taylor vs KICS vs HostSeq ", param_suffix_taylor))
+          ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_dot_simplified", param_suffix_taylor, ".png"),
+                 plot = p_dot_cohort_simple, width = 18, height = 12)
+        }, error = function(e) cat("Warning: Could not create simplified cohort dotplot:", e$message, "\n"))
+
+        tryCatch({
+          p_cnet_cohort_simple <- cnetplot(ora_re_cohort_comparison_simple, showCategory = 5,
+                                          colorEdge = TRUE, node_label = "category")
+          titled_print(p_cnet_cohort_simple, paste0("RE Pathway Cnetplot (Simplified) - Taylor vs KICS vs HostSeq ", param_suffix_taylor))
+          ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_cnet_simplified", param_suffix_taylor, ".png"),
+                 plot = p_cnet_cohort_simple, width = 14, height = 9)
+        }, error = function(e) cat("Warning: Could not create simplified cohort cnetplot:", e$message, "\n"))
+
+        tryCatch({
+          ora_re_cohort_simple_pairwise <- pairwise_termsim(ora_re_cohort_comparison_simple)
+          p_emap_cohort_simple <- emapplot(ora_re_cohort_simple_pairwise, showCategory = 20)
+          titled_print(p_emap_cohort_simple, paste0("RE Pathway Emapplot (Simplified) - Taylor vs KICS vs HostSeq ", param_suffix_taylor))
+          ggsave(paste0(plot_dir, "taylor/re_pathway_cohort_comparison_emap_simplified", param_suffix_taylor, ".png"),
+                 plot = p_emap_cohort_simple, width = 14, height = 9)
+        }, error = function(e) cat("Warning: Could not create simplified cohort emapplot:", e$message, "\n"))
+      } else {
+        cat("No pathways remained after simplification\n")
+      }
     } else {
       cat("No significant pathways found for cohort comparison\n")
     }
   } else {
-    cat("Not enough genes per cohort for pathway analysis (minimum 5 required)\n")
+    cat("Not enough genes per cohort for pathway analysis (minimum", params_re_taylor$min_genes_per_group, "required)\n")
   }
 }, error = function(e) {
   cat("Warning: Could not perform RE cohort comparison:", e$message, "\n")
 })
+
+} # End of RE pathway parameter loop
 
 # Close the PDF device at the end
 dev.off()
@@ -457,7 +666,7 @@ cat("Generated plots saved to:", plot_dir, "\n")
 cat("PDF compilation saved to: graph_output.pdf\n")
 cat("Text output saved to:", stdout_file, "\n")
 
-# Close sink to stop redirecting output
-sink()
-
 cat("✓ Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()

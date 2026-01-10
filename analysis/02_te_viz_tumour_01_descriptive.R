@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("count_matrix", "expand", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_tumour.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "dataset/"), "DESCRIPTIVE")
 
 cat("Running 02_te_viz_tumour_01_descriptive.R...\n")
 
@@ -85,13 +89,13 @@ write_output(quote({
 }), "Summary Statistics for Tumour Samples")
 
 
-# TE count summary plot - all common (only if PROCESS_COMMON_TES is TRUE)
-if (PROCESS_COMMON_TES && exists("te_all_common_t")) {
+# TE count summary plot - all common (only if COMMON_MODE is TRUE)
+if (COMMON_MODE && exists("te_all_common_t")) {
   write_output(quote(plot_te_counts_summary(te_all_common_t, y_lab="Repeat count", log_scale=TRUE, breaks=c(10,100,1000))), "TE Count Summary Plot - All Common")
   titled_print(plot_te_counts_summary(te_all_common_t, y_lab="Repeat count", log_scale=TRUE, breaks=c(10,100,1000)), "TE Count Summary Plot - All Common")
   ggsave(paste0(plot_dir, "general/te_count_type_all_common.png"), width = 9, height = 5)
 } else {
-  cat("Skipping common TE plot (PROCESS_COMMON_TES = FALSE)\n")
+  cat("Skipping common TE plot (COMMON_MODE = FALSE)\n")
 }
 
 # TE count summary plot - all rare
@@ -103,13 +107,13 @@ ggsave(paste0(plot_dir, "general/te_count_type_all_rare.png"), width = 9, height
 write_output(quote(plot_te_counts_unique(te_aff_expand_t)), "TEs Shared by Samples")
 titled_print(plot_te_counts_unique(te_aff_expand_t), "TEs Shared by Samples")
 
-# Stacked bar plot for common TEs (only if PROCESS_COMMON_TES is TRUE)
-if (PROCESS_COMMON_TES && exists("te_aff_expand_common_t")) {
+# Stacked bar plot for common TEs (only if COMMON_MODE is TRUE)
+if (COMMON_MODE && exists("te_aff_expand_common_t")) {
   write_output(quote(stacked_bar_plot_num_samples(te_aff_expand_common_t, c(1, 5, 20))), "Stacked Bar Plot: # TEs in Range of Samples")
   titled_print(stacked_bar_plot_num_samples(te_aff_expand_common_t, c(1, 5, 20)), "Stacked Bar Plot: # TEs in Range of Samples")
   ggsave(paste0(plot_dir, "general/te_type_sample_common.png"), width = 9, height = 5)
 } else {
-  cat("Skipping common TE stacked bar plot (PROCESS_COMMON_TES = FALSE)\n")
+  cat("Skipping common TE stacked bar plot (COMMON_MODE = FALSE)\n")
 }
 
 
@@ -122,20 +126,7 @@ ggsave(paste0(plot_dir, "general/te_total_calls_kics.png"), width = 9, height = 
 cat("General statistics and plots for tumour data completed!\n")
 
 
-cat("\n===== FULL LENGTH LINE1 ANALYSIS =====\n")
-te_aff_expand_line_t <- te_aff_expand_t %>% filter(ALT=="LINE1")
-write_output(quote(summary(te_aff_expand_line_t$SV_length)), "Summary of LINE1 SV_length (affected)")
-te_aff_expand_line_fulllength_t <- te_aff_expand_line_t %>% filter(SV_length >= 5900)
-write_output(quote(nrow(te_aff_expand_line_fulllength_t)), "Number of full-length LINE1 (SV_length >= 5900)")
-# process combinations
-te_aff_expand_line_fulllength_processed_t <- process_all_combinations(te_aff_expand_line_fulllength_t)
-load(paste0(r_dir, "nohits_final_te_count_t_te_aff_selected_t", ".RData"))
-te_aff_expand_line_fulllength_processed_t <- as.data.frame(add_nohit_samples(te_aff_expand_line_fulllength_processed_t, nohits))
-# merge with clinical
-te_aff_expand_line_fulllength_processed_t <- merge_dfs(te_aff_expand_line_fulllength_processed_t, clinical, include_all_x = FALSE)
-cat("Plotting full-length LINE1 count by TP53 status (Kruskal test)...\n")
-titled_print(plot_count_kruskal(te_aff_expand_line_fulllength_processed_t, type=NA, chr=NA, group="TP53_status", log_scale=TRUE, x_lab=x_tp53, y_lab="Full-length LINE1 count"), "Full-length LINE1 by TP53 status")
-ggsave(paste0(plot_dir, "counts_cohort/te_count_full_length.png"), plot=plot_count_kruskal(te_aff_expand_line_fulllength_processed_t, type=NA, chr=NA, group="TP53_status", log_scale=TRUE, x_lab=x_tp53, y_lab="Full-length LINE1 count"), width = 3, height = 5)
+# NOTE: Full-length LINE1 analysis moved to 02_te_viz_tumour_14_fulllength_young_source.R
 
 
 cat("\n===== DESCRIBE DATASET =====\n")
@@ -160,3 +151,6 @@ cat("\n===== RNA GENE EXPRESSION ANALYSIS =====\n")
 
 
 cat("✓ Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()

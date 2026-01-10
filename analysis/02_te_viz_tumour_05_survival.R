@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("count_matrix", "survival", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_tumour.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "survival_burden/"), "SURVIVAL")
 
 cat("Running 02_te_viz_tumour_05_survival.R...\n")
 
@@ -53,7 +57,7 @@ tryCatch({
           time_years = round(time / 365.25, 2)
         )
 
-      survival_data_file <- paste0(r_dir_files, "survival_burden_data.csv")
+      survival_data_file <- paste0(plot_dir, "survival/survival_burden_data.csv")
       write.csv(survival_data_export, survival_data_file, row.names = FALSE)
       cat("✓ Survival data saved to:", basename(survival_data_file), "\n")
     }
@@ -67,3 +71,6 @@ tryCatch({
 
 
 cat("✓ Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()

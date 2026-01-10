@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("expand", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_germline.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "counts_clinical_kics/"), "METHYLATION")
 
 cat("Running 02_te_viz_germline_09_methylation.R...\n")
 
@@ -72,8 +76,7 @@ tryCatch({
 #  titled_print(plots_kruskal_lfs_seq[[i]], paste0("Kruskal plot (LFS sequencing, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
 #  ggsave(paste0(plot_dir, "te_count_kruskal_lfs_seq_", ifelse(is.na(types[i]), "all", types[i]), ".png"), plot=plots_kruskal_lfs_seq[[i]], width = 3, height = 5)
 #}
-
-
-
-
 cat("✓ Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()

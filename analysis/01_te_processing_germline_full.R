@@ -55,8 +55,8 @@ suppressPackageStartupMessages({
   library(dplyr)
 })
 
-# Source functions
-source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/functions_te.R")
+# Source OPTIMIZED functions (functions_te_full.R with cached metadata optimization)
+source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/functions_te_full.R")
 
 #### LOAD DATA ####
 cat("Loading raw germline data...\n")
@@ -146,7 +146,7 @@ if (!dir.exists(processed_dir)) {
   cat("Created directory:", processed_dir, "\n")
 }
 clinical_ancestry_file <- paste0(processed_dir, "clinical_ancestry_germline.csv")
-write.csv(clinical_ancestry, clinical_ancestry_file, row.names = FALSE)
+fwrite(clinical_ancestry, clinical_ancestry_file)
 cat("✓ Saved merged clinical and ancestry data to:", clinical_ancestry_file, "\n")
 
 # Filter TE types based on configuration
@@ -214,7 +214,7 @@ save(te_raw_prepped, file = paste0(r_dir, "te_raw_prepped.RData"))
 cat("\n========================================\n")
 cat("STEP 3.5: Splitting HostSeq samples\n")
 cat("========================================\n")
-cat("Splitting HostSeq samples into filtering (50%) and analysis (50%) groups...\n")
+cat("Splitting HostSeq samples into filtering (66%) and analysis (33%) groups...\n")
 
 # Merge ancestry data for stratified splitting
 cat("Merging ancestry data for stratified split...\n")
@@ -223,7 +223,7 @@ te_raw_prepped_with_ancestry <- merge_dfs(te_raw_prepped, ancestry, include_all_
 # Split HostSeq samples by adding labels (stratified by ancestry)
 hostseq_split <- split_hostseq_samples(
   te_data = te_raw_prepped_with_ancestry,
-  filter_pct = 50,
+  filter_pct = 66,
   seed = 123
 )
 
@@ -363,46 +363,31 @@ cat("STEP 3.9: Identifying samples with 0 TE calls\n")
 cat("========================================\n")
 
 # Get samples present in the TE data (excluding HostSeq filter group)
-# These are samples with RAW TEs before common filtering
-samples_with_raw_tes <- te_raw_labeled %>%
+samples_with_tes <- te_raw_labeled %>%
   filter(hostseq_group != "filter" | is.na(hostseq_group)) %>%
   pull(sample) %>%
   unique()
 
-# Create complete_samples excluding HostSeq filter group (for use in process_te_data_germline)
-complete_samples_analysis <- complete_samples[!complete_samples$V1 %in% hostseq_filter_samples, , drop = FALSE]
-cat("Complete samples for analysis (excluding HostSeq filter):", nrow(complete_samples_analysis), "\n")
+# Identify samples in complete_samples that have 0 TEs
+if (!is.null(complete_samples)) {
+  samples_zero_calls <- setdiff(complete_samples$V1, samples_with_tes)
 
-# Identify zero-call samples with annotation
-if (!is.null(complete_samples_analysis) && nrow(complete_samples_analysis) > 0) {
-  # Samples with 0 raw TEs (no TE calls at all)
-  samples_zero_raw <- setdiff(complete_samples_analysis$V1, samples_with_raw_tes)
+  if (length(samples_zero_calls) > 0) {
+    cat("Found", length(samples_zero_calls), "samples with 0 TE calls\n")
 
-  if (length(samples_zero_raw) > 0) {
-    cat("Found", length(samples_zero_raw), "samples with 0 raw TE calls\n")
-
-    # Save to file with annotation column
+    # Save to file
     zero_calls_file <- paste0(r_dir_files, "samples_zero_calls.txt")
-    zero_calls_df <- data.frame(
-      sample = samples_zero_raw,
-      reason = "zero_raw"
-    )
-    write.table(zero_calls_df, file = zero_calls_file,
-                sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
-    cat("✓ Saved list of 0-raw-call samples to:", zero_calls_file, "\n")
+    writeLines(samples_zero_calls, zero_calls_file)
+    cat("✓ Saved list of 0-call samples to:", zero_calls_file, "\n")
+    cat("These samples will NOT be added to the final dataset\n\n")
   } else {
-    # Initialize empty file with header for zero_rare samples to be appended later
-    zero_calls_file <- paste0(r_dir_files, "samples_zero_calls.txt")
-    zero_calls_df <- data.frame(sample = character(0), reason = character(0))
-    write.table(zero_calls_df, file = zero_calls_file,
-                sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
-    cat("✓ All samples in complete_samples have at least 1 raw TE call\n")
+    cat("✓ All samples in complete_samples have at least 1 TE call\n\n")
   }
 } else {
   cat("No complete_samples list provided - skipping 0-call check\n\n")
 }
 
-cat("Samples with raw TEs (excluding HostSeq filter):", length(samples_with_raw_tes), "\n\n")
+cat("Samples with TEs (excluding HostSeq filter):", length(samples_with_tes), "\n\n")
 
 ##### PROCESS RARE TE DATA ####
 cat("\n========================================\n")
@@ -413,7 +398,7 @@ cat("========================================\n")
 # Always capture process_te_data_germline output for processed_output.txt
 process_te_stdout <- capture.output({
   final_te_count <- process_te_data_germline(te_raw_labeled, clinical, metrics, ancestry,
-                                            complete_samples = complete_samples_analysis,
+                                            complete_samples = NULL,
                                             apply_filter_common = TRUE, rare_gnomad = 3, rare_hostseq = 3,
                                             split_by_gene = FALSE, apply_process_combinations = TRUE,
                                             return_exclusion_tracker = TRUE, apply_age_filter = FALSE)
@@ -434,36 +419,13 @@ save(final_te_count, file = paste0(r_dir, "final_te_count_rare.RData"))
 invisible(capture.output({
   suppressMessages({
     final_te_count_expand <- process_te_data_germline(te_raw_labeled, clinical, metrics, ancestry,
-                                                    complete_samples = complete_samples_analysis,
+                                                    complete_samples = NULL,
                                                     apply_filter_common = TRUE, rare_gnomad = 3, rare_hostseq = 3,
                                                     split_by_gene = FALSE, apply_process_combinations = FALSE,
                                                     apply_age_filter = FALSE)
   })
 }))
 save(final_te_count_expand, file = paste0(r_dir, "final_te_count_expand_rare.RData"))
-
-# Identify samples that had raw TEs but 0 rare TEs (all filtered as common)
-# These are samples in samples_with_raw_tes but not in final_te_count
-samples_in_final <- unique(final_te_count$sample)
-samples_zero_rare <- setdiff(samples_with_raw_tes, samples_in_final)
-# Also exclude HostSeq filter samples (should already be excluded, but be safe)
-samples_zero_rare <- samples_zero_rare[!samples_zero_rare %in% hostseq_filter_samples]
-
-if (length(samples_zero_rare) > 0) {
-  cat("Found", length(samples_zero_rare), "samples with 0 rare TEs (all TEs were common)\n")
-
-  # Append to existing samples_zero_calls.txt file
-  zero_calls_file <- paste0(r_dir_files, "samples_zero_calls.txt")
-  zero_rare_df <- data.frame(
-    sample = samples_zero_rare,
-    reason = "zero_rare"
-  )
-  write.table(zero_rare_df, file = zero_calls_file,
-              sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE, append = TRUE)
-  cat("✓ Appended", length(samples_zero_rare), "zero_rare samples to:", zero_calls_file, "\n")
-} else {
-  cat("✓ All samples with raw TEs have at least 1 rare TE\n")
-}
 
 # Rare TE: split by gene format
 # COMMENTED OUT: Using split data from annotSV for better gene annotations
@@ -678,19 +640,19 @@ cat("\n========================================\n")
 cat("Exporting CSV files\n")
 cat("========================================\n")
 # Export split dataframes to CSV (germline has no _selected version)
-write.csv(final_te_count_expand_split$te_aff, paste0(r_dir_files, "te_aff_split.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand_split$te_aff, paste0(r_dir_files, "te_aff_split.csv"))
 cat("Exported te_aff_split.csv to files directory\n")
 
-write.csv(final_te_count_expand_split$te_aff_unaff, paste0(r_dir_files, "te_aff_unaff_split.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand_split$te_aff_unaff, paste0(r_dir_files, "te_aff_unaff_split.csv"))
 cat("Exported te_aff_unaff_split.csv to files directory\n")
 
-write.csv(final_te_count_expand_split$te_lfs, paste0(r_dir_files, "te_lfs_split.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand_split$te_lfs, paste0(r_dir_files, "te_lfs_split.csv"))
 cat("Exported te_lfs_split.csv to files directory\n")
 
-write.csv(final_te_count_expand_split$te_lfs_mut_wt, paste0(r_dir_files, "te_lfs_mut_wt_split.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand_split$te_lfs_mut_wt, paste0(r_dir_files, "te_lfs_mut_wt_split.csv"))
 cat("Exported te_lfs_mut_wt_split.csv to files directory\n")
 
-write.csv(final_te_count_expand_split$te_kics_hostseq, paste0(r_dir_files, "te_kics_hostseq_split.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand_split$te_kics_hostseq, paste0(r_dir_files, "te_kics_hostseq_split.csv"))
 cat("Exported te_kics_hostseq_split.csv to files directory\n")
 
 # Export to HPC directory
@@ -700,38 +662,38 @@ cat("========================================\n")
 
 # Export split format (one row per TE-gene overlap)
 cat("\nExporting split format files (excluding INFO, sample_topography, po_*, P_* columns)...\n")
-write.csv(final_te_count_expand_split$te_aff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_split.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_split$te_aff_unaff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_unaff_split.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_split$te_lfs %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_split.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_split$te_lfs_mut_wt %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_mut_wt_split.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand_split$te_kics_hostseq %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_hostseq_split.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand_split$te_aff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_split.csv"))
+fwrite(final_te_count_expand_split$te_aff_unaff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_unaff_split.csv"))
+fwrite(final_te_count_expand_split$te_lfs %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_split.csv"))
+fwrite(final_te_count_expand_split$te_lfs_mut_wt %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_mut_wt_split.csv"))
+fwrite(final_te_count_expand_split$te_kics_hostseq %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_hostseq_split.csv"))
 cat("✓ Exported split format files\n")
 
 # Export count matrix format (one row per sample with TE counts)
 cat("\nExporting count matrix format files (excluding INFO, sample_topography, po_*, P_* columns)...\n")
-write.csv(final_te_count$te_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count$te_aff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count$te_lfs %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count$te_lfs_mut_wt %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_mut_wt.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count$te_kics %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count$te_taylor %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_taylor.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count$te_hostseq %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_hostseq.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count$te_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all.csv"))
+fwrite(final_te_count$te_aff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff.csv"))
+fwrite(final_te_count$te_lfs %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs.csv"))
+fwrite(final_te_count$te_lfs_mut_wt %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_mut_wt.csv"))
+fwrite(final_te_count$te_kics %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics.csv"))
+fwrite(final_te_count$te_taylor %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_taylor.csv"))
+fwrite(final_te_count$te_hostseq %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_hostseq.csv"))
 cat("✓ Exported count matrix format files\n")
 
 # Export expand format (one row per complete TE insertion)
 cat("\nExporting expand format files (excluding INFO, sample_topography, po_*, P_* columns)...\n")
-write.csv(final_te_count_expand$te_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all_expand.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand$te_aff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_expand.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand$te_lfs %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_expand.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand$te_lfs_mut_wt %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_mut_wt_expand.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand$te_kics %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_expand.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand$te_taylor %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_taylor_expand.csv"), row.names = FALSE, quote = FALSE)
-write.csv(final_te_count_expand$te_hostseq %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_hostseq_expand.csv"), row.names = FALSE, quote = FALSE)
+fwrite(final_te_count_expand$te_all %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_all_expand.csv"))
+fwrite(final_te_count_expand$te_aff %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_expand.csv"))
+fwrite(final_te_count_expand$te_lfs %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_expand.csv"))
+fwrite(final_te_count_expand$te_lfs_mut_wt %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_lfs_mut_wt_expand.csv"))
+fwrite(final_te_count_expand$te_kics %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_expand.csv"))
+fwrite(final_te_count_expand$te_taylor %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_taylor_expand.csv"))
+fwrite(final_te_count_expand$te_hostseq %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_hostseq_expand.csv"))
 
 # Create and export derived expand datasets
 te_aff_unaff_expand <- final_te_count_expand$te_all %>%
   filter(cohort != "Taylor" & cohort != "HostSeq")
-write.csv(te_aff_unaff_expand %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_unaff_expand.csv"), row.names = FALSE, quote = FALSE)
+fwrite(te_aff_unaff_expand %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_aff_unaff_expand.csv"))
 
 cat("\nCreating KICS + HostSeq combined dataset:\n")
 cat("  KICS samples:", nrow(final_te_count_expand$te_kics), "rows\n")
@@ -748,7 +710,7 @@ te_kics_hostseq_expand <- as.data.frame(
             fill = TRUE, use.names = TRUE)
 )
 cat("  Combined total:", nrow(te_kics_hostseq_expand), "rows\n")
-write.csv(te_kics_hostseq_expand %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_hostseq_expand.csv"), row.names = FALSE, quote = FALSE)
+fwrite(te_kics_hostseq_expand %>% select(-any_of(c("INFO", "sample_topography")), -matches("^po_"), -matches("^P_")), paste0(hpc_dir, "te_kics_hostseq_expand.csv"))
 cat("✓ Exported expand format files\n")
 
 # Extract nohits from final_te_count (samples with total == 0)
@@ -767,7 +729,7 @@ cat("========================================\n")
 if (nrow(exclusion_tracker_master) > 0) {
   # Write excluded samples to CSV
   exclusion_output_file <- paste0(r_dir_files, "excluded_samples_germline.csv")
-  write.csv(exclusion_tracker_master, exclusion_output_file, row.names = FALSE)
+  fwrite(exclusion_tracker_master, exclusion_output_file)
   cat("✓ Exported", nrow(exclusion_tracker_master), "excluded sample records to:", exclusion_output_file, "\n")
 
   # Print summary by exclusion reason

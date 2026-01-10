@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("count_matrix", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_tumour.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "pca_umap/"), "PCA_UMAP")
 
 cat("Running 02_te_viz_tumour_09_pca_umap.R...\n")
 
@@ -183,3 +187,6 @@ cat("Running 02_te_viz_tumour_09_pca_umap.R...\n")
 
 
 cat("✓ Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()
