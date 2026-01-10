@@ -42,6 +42,7 @@ suppressPackageStartupMessages({
   library(ComplexHeatmap)
   library(circlize)
   library(dplyr)
+  library(msigdbr)        # MSigDB gene sets (Hallmark, Oncogenic, GO, Reactome)
 })
 
 # Source functions
@@ -71,6 +72,18 @@ titled_print <- function(plot, title) {
   } else {
     print(plot)
   }
+}
+
+# Helper function to initialize module-specific sink for text output
+init_module_sink <- function(output_dir, module_name) {
+  stdout_file <- paste0(output_dir, module_name, "_GRAPH_OUTPUT.txt")
+  if (file.exists(stdout_file)) file.remove(stdout_file)
+  sink(stdout_file, split = TRUE)
+}
+
+# Helper function to close module-specific sink
+close_module_sink <- function() {
+  sink()
 }
 
 cat("✓ Common setup loaded successfully\n")

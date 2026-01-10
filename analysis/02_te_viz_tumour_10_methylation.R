@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("expand", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_tumour.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "methylation/"), "METHYLATION")
 
 cat("Running 02_te_viz_tumour_10_methylation.R...\n")
 
@@ -17,7 +21,7 @@ tryCatch({
     te_expand = te_aff_expand_t,
     probe_file = "/Users/briannelaverty/Documents/R_Malkin/te/data/lfs_probe_info.csv",
     min_overlap_pct = 0,
-    output_file = paste0(r_dir_files, "methylation_probe_overlaps_tumour.csv")
+    output_file = paste0(plot_dir, "methylation/methylation_probe_overlaps_tumour.csv")
   )
 
   if (!is.null(te_probe_overlaps_t)) {
@@ -32,3 +36,6 @@ cat("\n===== STRUCTURAL VARIANT - TE OVERLAP ANALYSIS =====\n")
 
 
 cat("✓ Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()

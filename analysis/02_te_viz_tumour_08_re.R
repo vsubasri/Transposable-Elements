@@ -1,443 +1,1827 @@
 #!/usr/bin/env Rscript
 
-# Tumour TE Visualization - Regulatory Elements
-# RE pathway analysis and RE-RNA differential expression
+# Tumour TE Visualization - Regulatory Elements (Multi-Database ORA)
+# GLM-based differential incidence testing with covariate control
+# Databases: GO_BP, Reactome, MSigDB_Hallmark, MSigDB_Oncogenic (no KEGG)
+# Note: RE-RNA analysis moved to 02_te_viz_tumour_09_re_rna.R
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("count_matrix", "expand", "split", "clinical")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_tumour.R")
 
-cat("Running 02_te_viz_tumour_07_re.R...\n")
+# Load emmeans for post-hoc contrasts
+library(emmeans)
 
-#### PARAMETER SWEEP CONFIGURATION ####
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "reg_element/"), "RE")
 
-# Parameter grid for RE-RNA differential expression analysis
-cat("\n*** RE-RNA DIFFERENTIAL EXPRESSION ANALYSIS ***\n")
-param_grid_re_rna <- expand.grid(
-  min_samples_per_group = c(3),
-  p_gene = c(0.05, 0.1),
-  p_pathway = c(0.05, 0.1),
-  q_pathway = c(0.05, 0.1),
+# Initialize run summary with analysis_type column for ora/glm_ora/glm_gsea
+# Sorted by analysis_name first to group all same analyses together
+run_summary <- data.frame(
+  analysis_name = character(),
+  analysis_type = character(),        # "ora", "glm_ora", or "glm_gsea"
+  group_col = character(),
+  any_pathway_significant = logical(), # TRUE if any pathway count > 0
+  pathways_significant = character(),  # "GO_BP:5, Reactome:3, Hallmark:0, Oncogenic:0"
+  n_samples_per_group = character(),
+  genes_tested = integer(),           # ora: genes with minsample; glm_*: genes tested by GLM
+  genes_significant = integer(),      # ora: genes passing minsample; glm_*: genes passing qgene
+  enrichment_ran = logical(),         # Did ORA/GSEA run?
+  minsample = integer(),
+  qgene = numeric(),                  # ora/glm_gsea: NA; glm_ora: qgene threshold
+  mingene = integer(),                # ora/glm_ora: mingene; glm_gsea: NA
+  qpathway = numeric(),
+  groups = character(),
+  glm_errors = integer(),             # ora: NA; glm_*: GLM errors
+  posthoc_errors = integer(),
+  posthoc_skipped = character(),
   stringsAsFactors = FALSE
 )
-cat("Testing", nrow(param_grid_re_rna), "parameter combinations\n\n")
 
-#### REGULATORY ELEMENTS ANALYSIS ####
-write_output(quote(NULL), "Regulatory Elements (RE) Pathway Analysis - Tumour")
+cat("Running 02_te_viz_tumour_08_re.R...\n")
+cat("Multi-database ORA analysis with GLM-based gene filtering\n")
+cat("Databases: GO_BP, Reactome, Hallmark, Oncogenic\n\n")
 
-# Parameter grid for RE pathway analyses
-# Filter genes by minimum samples, then run pathway analysis
-cat("\n*** RE PATHWAY ANALYSIS ***\n")
-param_grid_re_pathway <- expand.grid(
-  min_samples_per_group = c(3),
-  p_pathway = c(0.05, 0.1),
-  q_pathway = c(0.05, 0.1),
-  stringsAsFactors = FALSE
-)
-cat("Testing", nrow(param_grid_re_pathway), "parameter combinations\n\n")
+#### CONFIGURATION ####
 
-# Load and join RE data for each relevant dataframe (do this once, outside the loop)
+# Databases to run (no KEGG per plan)
+DATABASES_TO_RUN <- c("GO_BP", "Reactome", "Hallmark", "Oncogenic")
+
+# Parameter settings (per plan)
+MIN_SAMPLES_VALUES <- c(3, 5)
+Q_GENE_VALUES <- c(0.05, 0.1, 0.25)  # For GLM gene filtering
+MIN_GENE_VALUES <- c(3, 5)           # Min genes hitting pathway
+Q_PATHWAY_VALUES <- c(0.05, 0.1, 0.25)  # For pathway filtering
+
+# Load background regulatory genes
+background_genes_file <- "/Users/briannelaverty/Documents/R_Malkin/TE/data/final/background_regulatory_genes.txt"
+if (file.exists(background_genes_file)) {
+  BACKGROUND_GENES <- readLines(background_genes_file)
+  cat("Loaded", length(BACKGROUND_GENES), "background regulatory genes for ORA universe\n")
+} else {
+  # Fall back to regular background genes
+  background_genes_file <- "/Users/briannelaverty/Documents/R_Malkin/TE/data/final/background_genes.txt"
+  if (file.exists(background_genes_file)) {
+    BACKGROUND_GENES <- readLines(background_genes_file)
+    cat("Loaded", length(BACKGROUND_GENES), "background genes for ORA universe\n")
+  } else {
+    BACKGROUND_GENES <- NULL
+    cat("Warning: Background genes file not found. ORA will use default universe.\n")
+  }
+}
+
+# Create base output directories for three analysis types
+re_dir <- paste0(plot_dir, "reg_element/")
+ora_dir <- paste0(re_dir, "ora/")
+glm_ora_dir <- paste0(re_dir, "glm_ora/")
+glm_gsea_dir <- paste0(re_dir, "glm_gsea/")
+
+dir.create(re_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(ora_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(glm_ora_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(glm_gsea_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("Base output directory:", re_dir, "\n")
+cat("  - ora/: Simple ORA (minsample filter only)\n")
+cat("  - glm_ora/: GLM-based ORA\n")
+cat("  - glm_gsea/: GLM-based GSEA\n\n")
+
+#### ADD 3-LEVEL TP53 CLASSIFICATION ####
+cat("Adding 3-level TP53 classification (Germline/Somatic/WT)...\n")
+te_all_t <- add_tp53_3level(te_all_t)
+cat("TP53_3level distribution:\n")
+print(table(te_all_t$TP53_3level, useNA = "always"))
+cat("\n")
+
+if (exists("te_aff_t")) {
+  te_aff_t <- add_tp53_3level(te_aff_t)
+}
+if (exists("te_kics_t")) {
+  te_kics_t <- add_tp53_3level(te_kics_t)
+}
+if (exists("te_lfs_t")) {
+  te_lfs_t <- add_tp53_3level(te_lfs_t)
+}
+
+#### LOAD AND PROCESS RE DATA ####
+write_output(quote(NULL), "Loading Regulatory Elements Data")
+
 re_tumour_path <- "/Users/briannelaverty/Documents/R_Malkin/TE/data/final/tumour_annotSV_output.SV_RE_intersect.report"
 
-cat("\n=== Loading and joining RE data for all cohorts ===\n")
-te_aff_re_t <- load_and_join_re_data(te_aff_expand_t, re_tumour_path)
-te_aff_re_split_t <- split_re_genes(te_aff_re_t)
+cat("Loading RE data using preprocess_re_for_rna() for all cohorts...\n")
 
-# Loop through RE pathway parameter combinations
-for (i in 1:nrow(param_grid_re_pathway)) {
-  params_re <- param_grid_re_pathway[i, ]
+# Affected cohort (for TP53 stratification)
+re_aff_preprocessed <- preprocess_re_for_rna(
+  re_report_path = re_tumour_path,
+  valid_samples = unique(te_aff_t$sample)
+)
+te_aff_re_split_t <- re_aff_preprocessed$re_split
+cat("Affected RE data:", nrow(te_aff_re_split_t), "rows,",
+    length(unique(te_aff_re_split_t$sample_id)), "samples,",
+    length(unique(te_aff_re_split_t$gene_reg)), "genes\n")
 
-  # Create parameter suffix
-  param_suffix_re_pathway <- paste0(
-    "_min", params_re$min_samples_per_group,
-    "_ppathway", params_re$p_pathway,
-    "_qpathway", params_re$q_pathway
+# LFS cohort (for Cancer stratification)
+re_lfs_preprocessed <- preprocess_re_for_rna(
+  re_report_path = re_tumour_path,
+  valid_samples = unique(te_lfs_t$sample)
+)
+te_lfs_re_split_t <- re_lfs_preprocessed$re_split
+cat("LFS RE data:", nrow(te_lfs_re_split_t), "rows,",
+    length(unique(te_lfs_re_split_t$sample_id)), "samples,",
+    length(unique(te_lfs_re_split_t$gene_reg)), "genes\n")
+
+# KICS cohort (for general/tumor type analyses)
+re_kics_preprocessed <- preprocess_re_for_rna(
+  re_report_path = re_tumour_path,
+  valid_samples = unique(te_kics_t$sample)
+)
+te_kics_re_split_t <- re_kics_preprocessed$re_split
+cat("KICS RE data:", nrow(te_kics_re_split_t), "rows,",
+    length(unique(te_kics_re_split_t$sample_id)), "samples,",
+    length(unique(te_kics_re_split_t$gene_reg)), "genes\n")
+
+# Taylor cohort (for subtype analysis)
+if (exists("te_taylor_expand_t") && nrow(te_taylor_expand_t) > 0) {
+  re_taylor_preprocessed <- preprocess_re_for_rna(
+    re_report_path = re_tumour_path,
+    valid_samples = unique(te_taylor_expand_t$sample)
   )
+  te_taylor_re_split_t <- re_taylor_preprocessed$re_split
+  cat("Taylor RE data:", nrow(te_taylor_re_split_t), "rows,",
+      length(unique(te_taylor_re_split_t$sample_id)), "samples,",
+      length(unique(te_taylor_re_split_t$gene_reg)), "genes\n")
+} else {
+  cat("Taylor RE data: not available (te_taylor_expand_t not loaded)\n")
+  te_taylor_re_split_t <- NULL
+}
+cat("\n")
 
-  cat("\n\n===== TESTING RE PATHWAY PARAMETERS", i, "/", nrow(param_grid_re_pathway), "=====\n")
-  cat("min_samples_per_group =", params_re$min_samples_per_group,
-      ", p_pathway =", params_re$p_pathway, ", q_pathway =", params_re$q_pathway, "\n")
+# Add metadata columns to RE data
+if ("TP53_status" %in% colnames(te_all_t)) {
+  tp53_mapping <- te_all_t %>%
+    select(sample, TP53_status, TP53_3level) %>%
+    distinct()
 
-# Analysis 1: General affected cohort (te_aff_expand_t)
-cat("\n=== Regulatory Elements Analysis: Affected Cohort (Tumour) ===\n")
+  te_aff_re_split_t <- te_aff_re_split_t %>%
+    left_join(tp53_mapping, by = c("sample_id" = "sample"))
+  te_kics_re_split_t <- te_kics_re_split_t %>%
+    left_join(tp53_mapping, by = c("sample_id" = "sample"))
+  te_lfs_re_split_t <- te_lfs_re_split_t %>%
+    left_join(tp53_mapping, by = c("sample_id" = "sample"))
+}
 
-cat("\nRunning pathway analysis...\n")
-n_genes_input_t <- length(unique(te_aff_re_split_t$gene_reg))
-n_samples_input_t <- length(unique(te_aff_re_split_t$sample.x))
+if ("Cancer" %in% colnames(te_all_t)) {
+  cancer_mapping <- te_all_t %>%
+    select(sample, Cancer) %>%
+    distinct()
 
-# Write data summary before analysis
-summary_text <- paste0("RE Pathway Analysis Summary - Affected Tumour Cohort\n",
-                      "====================================================\n\n",
-                      "Total samples: ", n_samples_input_t, "\n",
-                      "Total genes: ", n_genes_input_t, "\n",
-                      "Parameters: min_samples=", params_re$min_samples_per_group,
-                      ", p<", params_re$p_pathway, ", q<", params_re$q_pathway, "\n\n",
-                      "Status: Running analysis...")
-writeLines(summary_text, paste0(plot_dir, "reg_element/re_pathway_aff_tumour_summary", param_suffix_re_pathway, ".txt"))
+  te_lfs_re_split_t <- te_lfs_re_split_t %>%
+    left_join(cancer_mapping, by = c("sample_id" = "sample"))
+}
 
-ora_re_aff_t <- perform_re_pathway_analysis(te_aff_re_split_t, analysis_type = "general", min_samples = params_re$min_samples_per_group, p_pathway = params_re$p_pathway, q_pathway = params_re$q_pathway)
+if ("tumor_type" %in% colnames(te_all_t)) {
+  tumor_type_mapping <- te_all_t %>%
+    select(sample, tumor_type) %>%
+    distinct()
 
-if (!is.null(ora_re_aff_t) && (inherits(ora_re_aff_t, "enrichResult") || inherits(ora_re_aff_t, "compareClusterResult")) && nrow(as.data.frame(ora_re_aff_t)) > 0) {
-  cat("Pathway analysis successful! Found", nrow(as.data.frame(ora_re_aff_t)), "significant pathways\n")
-  write.csv(as.data.frame(ora_re_aff_t), paste0(r_dir_files, "re_pathway_aff_tumour", param_suffix_re_pathway, ".csv"), row.names=FALSE)
+  te_kics_re_split_t <- te_kics_re_split_t %>%
+    left_join(tumor_type_mapping, by = c("sample_id" = "sample"))
+}
 
-  # Update summary with results
-  summary_text <- paste0("RE Pathway Analysis Summary - Affected Tumour Cohort\n",
-                        "====================================================\n\n",
-                        "Total samples: ", n_samples_input_t, "\n",
-                        "Total genes: ", n_genes_input_t, "\n",
-                        "Parameters: min_samples=", params_re$min_samples_per_group,
-                        ", p<", params_re$p_pathway, ", q<", params_re$q_pathway, "\n\n",
-                        "Status: SUCCESS\n",
-                        "Significant pathways found: ", nrow(as.data.frame(ora_re_aff_t)))
-  writeLines(summary_text, paste0(plot_dir, "reg_element/re_pathway_aff_tumour_summary", param_suffix_re_pathway, ".txt"))
+if ("predicted_ancestry_thres" %in% colnames(te_all_t)) {
+  ancestry_mapping <- te_all_t %>%
+    select(sample, predicted_ancestry_thres) %>%
+    distinct()
 
-  cat("Creating barplot...\n")
-  p_bar_ora_re_aff_t <- barplot(ora_re_aff_t, showCategory=20)
-  titled_print(p_bar_ora_re_aff_t, "ORA barplot (RE - Affected Tumour)")
-  ggsave(paste0(plot_dir, "reg_element/re_pathway_aff_tumour_bar", param_suffix_re_pathway, ".png"), plot=p_bar_ora_re_aff_t, width=14, height=9)
+  te_kics_re_split_t <- te_kics_re_split_t %>%
+    left_join(ancestry_mapping, by = c("sample_id" = "sample"))
+}
 
-  cat("Creating dotplot...\n")
-  p_dot_ora_re_aff_t <- dotplot(ora_re_aff_t, showCategory=20)
-  titled_print(p_dot_ora_re_aff_t, "ORA dotplot (RE - Affected Tumour)")
-  ggsave(paste0(plot_dir, "reg_element/re_pathway_aff_tumour_dot", param_suffix_re_pathway, ".png"), plot=p_dot_ora_re_aff_t, width=14, height=9)
+if ("cohort" %in% colnames(te_all_t)) {
+  cohort_mapping <- te_all_t %>%
+    select(sample, cohort) %>%
+    distinct()
 
-  cat("Creating cnetplot...\n")
-  p_cnet_ora_re_aff_t <- cnetplot(ora_re_aff_t, showCategory=10, colorEdge=TRUE, node_label="category")
-  titled_print(p_cnet_ora_re_aff_t, "RE ORA cnetplot (Affected Tumour)")
-  ggsave(paste0(plot_dir, "reg_element/re_pathway_aff_tumour_cnet", param_suffix_re_pathway, ".png"), plot=p_cnet_ora_re_aff_t, width=14, height=9)
+  te_lfs_re_split_t <- te_lfs_re_split_t %>%
+    left_join(cohort_mapping, by = c("sample_id" = "sample"))
+}
 
-  cat("Creating emapplot...\n")
+# Add sample column as alias for sample_id (needed for GLM function)
+te_aff_re_split_t$sample <- te_aff_re_split_t$sample_id
+te_kics_re_split_t$sample <- te_kics_re_split_t$sample_id
+te_lfs_re_split_t$sample <- te_lfs_re_split_t$sample_id
+if (!is.null(te_taylor_re_split_t)) {
+  te_taylor_re_split_t$sample <- te_taylor_re_split_t$sample_id
+}
+
+# Add covariates for GLM analysis
+covar_columns <- c("sample", "age_at_diagnosis", "med_cov", "total_reads",
+                   "med_read_len", "pct_chimeras", "avg_quality")
+covar_mapping <- te_all_t %>%
+  select(any_of(covar_columns)) %>%
+  distinct()
+
+te_aff_re_split_t <- te_aff_re_split_t %>%
+  left_join(covar_mapping, by = "sample")
+te_kics_re_split_t <- te_kics_re_split_t %>%
+  left_join(covar_mapping, by = "sample")
+te_lfs_re_split_t <- te_lfs_re_split_t %>%
+  left_join(covar_mapping, by = "sample")
+
+# Add Taylor metadata (tumor_type_subclass from te_taylor_expand_t)
+if (!is.null(te_taylor_re_split_t) && exists("te_taylor_expand_t")) {
+  taylor_metadata <- te_taylor_expand_t %>%
+    select(sample, any_of(c("tumor_type_subclass", "tumor_type"))) %>%
+    distinct()
+  te_taylor_re_split_t <- te_taylor_re_split_t %>%
+    left_join(taylor_metadata, by = "sample")
+  cat("Added metadata to Taylor RE data\n")
+}
+
+cat("Added sample alias and covariates to RE data\n\n")
+
+#### HELPER FUNCTIONS ####
+
+# Helper: Create 7 types of ORA visualizations
+create_ora_visualizations <- function(ora_result, filtered_df, te_data, db, prefix, db_dir,
+                                      gene_col = "gene_reg", sample_col = "sample") {
+  n_terms <- nrow(filtered_df)
+  if (n_terms == 0) return(NULL)
+
+  # Filter the enrichResult object to only include pathways in filtered_df
+  # This ensures plots show only the post-hoc filtered pathways
+  filtered_result <- ora_result
+  if ("ID" %in% colnames(filtered_df)) {
+    filtered_ids <- unique(filtered_df$ID)
+    if (inherits(ora_result, "enrichResult")) {
+      # enrichResult uses @result slot
+      filtered_result@result <- filtered_result@result %>%
+        filter(ID %in% filtered_ids)
+    } else if (inherits(ora_result, "compareClusterResult")) {
+      # compareClusterResult uses @compareClusterResult slot
+      filtered_result@compareClusterResult <- filtered_result@compareClusterResult %>%
+        filter(ID %in% filtered_ids)
+    }
+  }
+
   tryCatch({
-    ora_re_aff_pairwise_t <- pairwise_termsim(ora_re_aff_t)
-    p_emap_ora_re_aff_t <- emapplot(ora_re_aff_pairwise_t, showCategory=20)
-    titled_print(p_emap_ora_re_aff_t, "ORA emapplot (RE - Affected Tumour)")
-    ggsave(paste0(plot_dir, "reg_element/re_pathway_aff_tumour_emap", param_suffix_re_pathway, ".png"), plot=p_emap_ora_re_aff_t, width=14, height=9)
-  }, error = function(e) {
-    cat("Warning: Could not create emapplot:", e$message, "\n")
-  })
+    # 1. Dotplot
+    p_dot <- enrichplot::dotplot(filtered_result, showCategory = min(20, n_terms))
+    ggsave(paste0(db_dir, prefix, "_dot.png"), p_dot, width = 10, height = 8)
 
-  cat("\nTop 5 enriched pathways:\n")
-  print(head(as.data.frame(ora_re_aff_t)[, c("Description", "pvalue", "p.adjust", "Count")], 5))
-} else {
-  # Update summary with failure status
-  if (is.null(ora_re_aff_t)) {
-    status_msg <- paste0("Status: INSUFFICIENT DATA\n",
-                        "Reason: Not enough samples or genes to run pathway analysis\n",
-                        "Minimum required: ", params_re$min_samples_per_group, " samples per group")
-  } else {
-    status_msg <- paste0("Status: NO SIGNIFICANT PATHWAYS\n",
-                        "Analysis completed but no pathways met significance thresholds")
-  }
-
-  summary_text <- paste0("RE Pathway Analysis Summary - Affected Tumour Cohort\n",
-                        "====================================================\n\n",
-                        "Total samples: ", n_samples_input_t, "\n",
-                        "Total genes: ", n_genes_input_t, "\n",
-                        "Parameters: min_samples=", params_re$min_samples_per_group,
-                        ", p<", params_re$p_pathway, ", q<", params_re$q_pathway, "\n\n",
-                        status_msg)
-  writeLines(summary_text, paste0(plot_dir, "reg_element/re_pathway_aff_tumour_summary", param_suffix_re_pathway, ".txt"))
-
-  cat(status_msg, "\n")
-}
-
-# Analysis 2: Affected cohort colored by TP53 status (te_aff_expand_t - same data as Analysis 1)
-cat("\n\n=== Regulatory Elements Analysis: Affected Cohort (by TP53 Status - Tumour) ===\n")
-
-# Check if TP53_status column exists (using te_aff_re_split_t from Analysis 1)
-if ("TP53_status" %in% colnames(te_aff_re_split_t)) {
-  cat("TP53_status groups:\n")
-  print(table(te_aff_re_split_t$TP53_status))
-
-  cat("\nRunning pathway analysis by TP53 status...\n")
-  n_genes_input_tp53_t <- length(unique(te_aff_re_split_t$gene_reg))
-  n_samples_input_tp53_t <- length(unique(te_aff_re_split_t$sample.x))
-  # Count samples per TP53 group
-  samples_per_tp53_t <- table(unique(te_aff_re_split_t[, c("sample.x", "TP53_status")])$TP53_status)
-  samples_per_tp53_t_str <- paste(names(samples_per_tp53_t), "=", samples_per_tp53_t, "samples", collapse=", ")
-
-  # Count genes per TP53 group BEFORE running analysis
-  genes_per_tp53_t <- te_aff_re_split_t %>%
-    group_by(TP53_status) %>%
-    summarise(n_genes = n_distinct(gene_reg), .groups = "drop")
-  genes_per_tp53_t_str <- paste(genes_per_tp53_t$TP53_status, "=", genes_per_tp53_t$n_genes, "genes", collapse=", ")
-
-  # Write data summary before analysis
-  summary_text <- paste0("RE Pathway Analysis Summary - Affected Tumour TP53 Status\n",
-                        "=========================================================\n\n",
-                        "Total samples: ", n_samples_input_tp53_t, "\n",
-                        "Samples per group: ", samples_per_tp53_t_str, "\n",
-                        "Total genes: ", n_genes_input_tp53_t, "\n",
-                        "Genes per group: ", genes_per_tp53_t_str, "\n",
-                        "Parameters: min_samples=", params_re$min_samples_per_group,
-                        ", p<", params_re$p_pathway, ", q<", params_re$q_pathway, "\n\n",
-                        "Status: Running analysis...")
-  writeLines(summary_text, paste0(plot_dir, "reg_element/re_pathway_aff_tp53_tumour_summary", param_suffix_re_pathway, ".txt"))
-
-  ora_re_aff_tp53_t <- perform_re_pathway_analysis(te_aff_re_split_t, analysis_type = "tp53", min_samples = params_re$min_samples_per_group, p_pathway = params_re$p_pathway, q_pathway = params_re$q_pathway)
-
-  if (!is.null(ora_re_aff_tp53_t) && (inherits(ora_re_aff_tp53_t, "enrichResult") || inherits(ora_re_aff_tp53_t, "compareClusterResult")) && nrow(as.data.frame(ora_re_aff_tp53_t)) > 0) {
-    cat("Pathway analysis successful! Found", nrow(as.data.frame(ora_re_aff_tp53_t)), "significant pathways\n")
-    write.csv(as.data.frame(ora_re_aff_tp53_t), paste0(r_dir_files, "re_pathway_aff_tp53_tumour", param_suffix_re_pathway, ".csv"), row.names=FALSE)
-
-    # Update summary with results
-    summary_text <- paste0("RE Pathway Analysis Summary - Affected Tumour TP53 Status\n",
-                          "=========================================================\n\n",
-                          "Total samples: ", n_samples_input_tp53_t, "\n",
-                          "Samples per group: ", samples_per_tp53_t_str, "\n",
-                          "Total genes: ", n_genes_input_tp53_t, "\n",
-                          "Genes per group: ", genes_per_tp53_t_str, "\n",
-                          "Parameters: min_samples=", params_re$min_samples_per_group,
-                          ", p<", params_re$p_pathway, ", q<", params_re$q_pathway, "\n\n",
-                          "Status: SUCCESS\n",
-                          "Significant pathways found: ", nrow(as.data.frame(ora_re_aff_tp53_t)))
-    writeLines(summary_text, paste0(plot_dir, "reg_element/re_pathway_aff_tp53_tumour_summary", param_suffix_re_pathway, ".txt"))
-
-    cat("Creating dotplot...\n")
-    p_dot_ora_re_tp53_t <- dotplot(ora_re_aff_tp53_t, showCategory=20)
-    titled_print(p_dot_ora_re_tp53_t, "ORA dotplot (RE - TP53 Status Tumour)")
-    ggsave(paste0(plot_dir, "reg_element/re_pathway_tp53_tumour_dot", param_suffix_re_pathway, ".png"), plot=p_dot_ora_re_tp53_t, width=14, height=9)
-
-    cat("Creating cnetplot...\n")
-    p_cnet_ora_re_tp53_t <- cnetplot(ora_re_aff_tp53_t, showCategory=10, colorEdge=TRUE, node_label="category")
-    titled_print(p_cnet_ora_re_tp53_t, "RE ORA cnetplot (TP53 Status Tumour)")
-    ggsave(paste0(plot_dir, "reg_element/re_pathway_tp53_tumour_cnet", param_suffix_re_pathway, ".png"), plot=p_cnet_ora_re_tp53_t, width=14, height=9)
-
-    cat("Creating emapplot...\n")
-    # Check if multiple clusters have results
-    cluster_counts <- table(as.data.frame(ora_re_aff_tp53_t)$Cluster)
-    cat("Cluster distribution:", paste(names(cluster_counts), "=", cluster_counts, collapse=", "), "\n")
-
-    if (length(cluster_counts) > 1) {
+    # 2. Cnetplot (gene-concept network)
+    if (inherits(filtered_result, "enrichResult")) {
       tryCatch({
-        ora_re_tp53_pairwise_t <- pairwise_termsim(ora_re_aff_tp53_t)
-        p_emap_ora_re_tp53_t <- emapplot(ora_re_tp53_pairwise_t, showCategory=20,
-                                          pie.params = list(pie = "count"),
-                                          cluster.params = list(cluster = TRUE, legend = TRUE))
-        titled_print(p_emap_ora_re_tp53_t, "ORA emapplot (RE - TP53 Tumour)")
-        ggsave(paste0(plot_dir, "reg_element/re_pathway_tp53_tumour_emap", param_suffix_re_pathway, ".png"), plot=p_emap_ora_re_tp53_t, width=14, height=9)
-      }, error = function(e) {
-        cat("Warning: Could not create emapplot:", e$message, "\n")
+        p_cnet <- enrichplot::cnetplot(filtered_result, showCategory = min(10, n_terms),
+                                        categorySize = "pvalue")
+        ggsave(paste0(db_dir, prefix, "_cnet.png"), p_cnet, width = 12, height = 10)
+      }, error = function(e) cat("    Cnetplot error:", e$message, "\n"))
+    }
+
+    # 3. Emapplot (enrichment map) - needs ≥5 terms
+    if (n_terms >= 5 && inherits(filtered_result, "enrichResult")) {
+      tryCatch({
+        ora_pairwise <- enrichplot::pairwise_termsim(filtered_result)
+        p_emap <- enrichplot::emapplot(ora_pairwise, showCategory = min(30, n_terms))
+        ggsave(paste0(db_dir, prefix, "_emap.png"), p_emap, width = 12, height = 10)
+      }, error = function(e) cat("    Emapplot error:", e$message, "\n"))
+    }
+
+    # 4. Heatplot
+    if (inherits(filtered_result, "enrichResult")) {
+      tryCatch({
+        p_heat <- enrichplot::heatplot(filtered_result, showCategory = min(20, n_terms))
+        ggsave(paste0(db_dir, prefix, "_heatplot.png"), p_heat, width = 14, height = 8)
+      }, error = function(e) cat("    Heatplot error:", e$message, "\n"))
+    }
+
+    # 5-7. Sample-level visualizations (balloon, heatmap, gene_pathway)
+    # These use filtered_df directly (already filtered)
+    if (!is.null(te_data) && n_terms > 0) {
+      tryCatch({
+        # Balloon plot
+        p_balloon <- plot_pathway_balloon(filtered_df, te_data, max_pathways = 20,
+                                           gene_col = gene_col)
+        if (!is.null(p_balloon)) {
+          ggsave(paste0(db_dir, prefix, "_balloon.png"), p_balloon, width = 14, height = 8)
+        }
+      }, error = function(e) cat("    Balloon plot error:", e$message, "\n"))
+
+      tryCatch({
+        # Sample-pathway heatmap
+        ht <- plot_pathway_sample_heatmap(filtered_df, te_data, max_pathways = 30,
+                                           gene_col = gene_col)
+        if (!is.null(ht)) {
+          png(paste0(db_dir, prefix, "_heatmap.png"), width = 12, height = 10, units = "in", res = 150)
+          ComplexHeatmap::draw(ht)
+          dev.off()
+        }
+      }, error = function(e) cat("    Heatmap error:", e$message, "\n"))
+
+      tryCatch({
+        # Gene-pathway heatmap
+        p_gene <- plot_pathway_gene_heatmap(filtered_df, te_data, max_pathways = 15,
+                                             max_genes = 50, gene_col = gene_col)
+        if (!is.null(p_gene)) {
+          ggsave(paste0(db_dir, prefix, "_gene_pathway.png"), p_gene, width = 12, height = 10)
+        }
+      }, error = function(e) cat("    Gene-pathway error:", e$message, "\n"))
+    }
+  }, error = function(e) cat("  Visualization error:", e$message, "\n"))
+}
+
+# Helper: Run compareCluster ORA for a specific database
+run_compareCluster_ora_by_db <- function(gene_clusters, db, background_genes = NULL, pvalueCutoff = 1) {
+  tryCatch({
+    if (db == "GO_BP") {
+      clusterProfiler::compareCluster(
+        geneCluster = gene_clusters,
+        fun = "enrichGO",
+        OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+        keyType = "SYMBOL",
+        ont = "BP",
+        universe = background_genes,
+        pvalueCutoff = pvalueCutoff,
+        qvalueCutoff = 1
+      )
+    } else if (db == "Reactome") {
+      # Convert to Entrez IDs for Reactome
+      gene_clusters_entrez <- lapply(gene_clusters, function(genes) {
+        ids <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, genes, "ENTREZID", "SYMBOL")
+        ids[!is.na(ids)]
       })
-    } else {
-      cat("Skipping emapplot: Only one cluster has results (", names(cluster_counts), ")\n")
-    }
-  } else {
-    # Update summary with failure status
-    if (is.null(ora_re_aff_tp53_t)) {
-      status_msg <- paste0("Status: INSUFFICIENT DATA\n",
-                          "Reason: Not enough samples per group to run pathway analysis\n",
-                          "Minimum required: ", params_re$min_samples_per_group, " samples per group")
-    } else {
-      status_msg <- paste0("Status: NO SIGNIFICANT PATHWAYS\n",
-                          "Analysis completed but no pathways met significance thresholds")
-    }
+      gene_clusters_entrez <- gene_clusters_entrez[sapply(gene_clusters_entrez, length) > 0]
 
-    summary_text <- paste0("RE Pathway Analysis Summary - Affected Tumour TP53 Status\n",
-                          "=========================================================\n\n",
-                          "Total samples: ", n_samples_input_tp53_t, "\n",
-                          "Samples per group: ", samples_per_tp53_t_str, "\n",
-                          "Total genes: ", n_genes_input_tp53_t, "\n",
-                          "Genes per group: ", genes_per_tp53_t_str, "\n",
-                          "Parameters: min_samples=", params_re$min_samples_per_group,
-                          ", p<", params_re$p_pathway, ", q<", params_re$q_pathway, "\n\n",
-                          status_msg)
-    writeLines(summary_text, paste0(plot_dir, "reg_element/re_pathway_aff_tp53_tumour_summary", param_suffix_re_pathway, ".txt"))
+      if (length(gene_clusters_entrez) >= 2) {
+        clusterProfiler::compareCluster(
+          geneCluster = gene_clusters_entrez,
+          fun = "enrichPathway",
+          organism = "human",
+          pvalueCutoff = pvalueCutoff,
+          qvalueCutoff = 1
+        )
+      } else {
+        NULL
+      }
+    } else if (db %in% c("Hallmark", "Oncogenic")) {
+      msig_category <- if (db == "Hallmark") "H" else "C6"
+      msig_db <- msigdbr::msigdbr(species = "Homo sapiens", category = msig_category)
+      msig_t2g <- msig_db %>% dplyr::select(gs_name, gene_symbol)
 
-    cat(status_msg, "\n")
-  }
-} else {
-  cat("WARNING: TP53_status column not found in te_aff_re_split_t, skipping TP53 analysis\n")
+      clusterProfiler::compareCluster(
+        geneCluster = gene_clusters,
+        fun = "enricher",
+        TERM2GENE = msig_t2g,
+        universe = background_genes,
+        pvalueCutoff = pvalueCutoff,
+        qvalueCutoff = 1
+      )
+    } else {
+      NULL
+    }
+  }, error = function(e) {
+    cat("    Error running compareCluster for", db, ":", e$message, "\n")
+    NULL
+  })
 }
 
-} # End of RE pathway parameter loop
+# Helper: Assign genes to groups based on which group has highest incidence
+assign_genes_to_groups_by_incidence <- function(te_data, genes, group_col, groups,
+                                                  gene_col = "gene_reg", sample_col = "sample") {
+  gene_clusters <- list()
 
+  for (g in groups) {
+    group_data <- te_data %>% filter(.data[[group_col]] == g)
+    group_samples <- unique(group_data[[sample_col]])
+    n_group <- length(group_samples)
 
-#### RE-RNA DIFFERENTIAL EXPRESSION TEST ####
-write_output(quote(NULL), "Running RE-RNA Differential Expression Analysis")
+    if (n_group == 0) next
 
-# Check if RNA data is available (requires running RNA script first)
-if (!exists("rna_filtered")) {
-  # Try to load saved rna_filtered from RNA script
-  rna_filtered_file <- paste0(r_dir_files, "rna_filtered_tumour.rds")
-  if (file.exists(rna_filtered_file)) {
-    cat("Loading rna_filtered from previously run RNA script...\n")
-    rna_filtered <- readRDS(rna_filtered_file)
-    cat("✓ Successfully loaded rna_filtered\n\n")
-  } else {
-    cat("⚠ WARNING: RNA data not processed (rna_filtered not found).\n")
-    cat("  The RE-RNA analysis requires RNA processing from 02_te_viz_tumour_07_rna.R\n")
-    cat("  Skipping RE-RNA differential expression analysis.\n")
-    cat("  To run this section, first run the RNA script or run the ALL script.\n\n")
+    # For each gene, count samples in this group
+    gene_incidence <- group_data %>%
+      filter(.data[[gene_col]] %in% genes) %>%
+      group_by(.data[[gene_col]]) %>%
+      summarise(n_samples = n_distinct(.data[[sample_col]]), .groups = "drop") %>%
+      mutate(incidence = n_samples / n_group)
+
+    gene_clusters[[g]] <- gene_incidence
   }
+
+  # Assign each gene to group with highest incidence
+  all_genes <- unique(unlist(lapply(gene_clusters, function(x) x[[gene_col]])))
+  gene_assignments <- list()
+
+  for (gene in all_genes) {
+    max_incidence <- 0
+    assigned_group <- groups[1]  # default
+
+    for (g in groups) {
+      if (!is.null(gene_clusters[[g]])) {
+        gene_row <- gene_clusters[[g]] %>% filter(.data[[gene_col]] == gene)
+        if (nrow(gene_row) > 0 && gene_row$incidence[1] > max_incidence) {
+          max_incidence <- gene_row$incidence[1]
+          assigned_group <- g
+        }
+      }
+    }
+
+    if (!assigned_group %in% names(gene_assignments)) {
+      gene_assignments[[assigned_group]] <- c()
+    }
+    gene_assignments[[assigned_group]] <- c(gene_assignments[[assigned_group]], gene)
+  }
+
+  return(gene_assignments)
 }
 
-if (exists("rna_filtered")) {
-  # Set up summary tracking for parameter sweep
-  sweep_summary <- data.frame()
+#### SIMPLE ORA FUNCTION (no GLM, just minsample filter) ####
+run_simple_ora_analysis_re <- function(te_data,
+                                        group_col,
+                                        groups,
+                                        analysis_name,
+                                        base_dir,  # ora/
+                                        databases = DATABASES_TO_RUN,
+                                        background_genes = BACKGROUND_GENES,
+                                        gene_col = "gene_reg",
+                                        sample_col = "sample") {
 
-  re_report_path_tumour <- "/Users/briannelaverty/Documents/R_Malkin/TE/data/final/tumour_annotSV_output.SV_RE_intersect.report"
+  cat("\n========================================\n")
+  cat("  Simple ORA Analysis (RE):", analysis_name, "\n")
+  cat("========================================\n")
+  cat("Group column:", group_col, "\n")
+  cat("Groups:", paste(groups, collapse = ", "), "\n")
 
-  # Loop through parameter combinations
-  for (i in 1:nrow(param_grid_re_rna)) {
-    params <- param_grid_re_rna[i, ]
+  # Calculate sample counts per group for run summary
+  actual_sample_col <- if (sample_col %in% colnames(te_data)) sample_col else "sample"
+  sample_counts <- te_data %>%
+    filter(!is.na(.data[[group_col]])) %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(n = n_distinct(.data[[actual_sample_col]]), .groups = "drop")
+  sample_counts_vec <- setNames(sample_counts$n, as.character(sample_counts[[group_col]]))
+  n_samples_str <- paste(names(sample_counts_vec), sample_counts_vec, sep = ":", collapse = ", ")
 
-    # Create parameter suffix for filenames
-    param_suffix <- paste0(
-      "_min", params$min_samples_per_group,
-      "_pgene", params$p_gene,
-      "_ppathway", params$p_pathway,
-      "_qpathway", params$q_pathway
-    )
+  analysis_base_dir <- paste0(base_dir, analysis_name, "/")
 
-    cat("\n\n===== TESTING RE-RNA PARAMETERS", i, "/", nrow(param_grid_re_rna), "=====\n")
-    cat("min_samples_per_group =", params$min_samples_per_group,
-        ", p_gene =", params$p_gene,
-        ", p_pathway =", params$p_pathway,
-        ", q_pathway =", params$q_pathway, "\n")
+  for (minsample in MIN_SAMPLES_VALUES) {
+    cat("\n--- minsample =", minsample, "---\n")
 
-    # Run differential expression test
-    re_rna_results_t <- test_rna_by_gene_re_status(
-      re_report_path = re_report_path_tumour,
-      rna_data = rna_filtered,
-      sample_type = "tumour",
-      min_gene_mentions = 1,
-      min_samples_per_group = params$min_samples_per_group
-    )
+    # Get genes with ≥ minsample samples having TE (overall, not per group)
+    gene_sample_counts <- te_data %>%
+      filter(!is.na(.data[[gene_col]]) & .data[[gene_col]] != "") %>%
+      group_by(.data[[gene_col]]) %>%
+      summarise(n_samples = n_distinct(.data[[actual_sample_col]]), .groups = "drop") %>%
+      filter(n_samples >= minsample)
 
-    # Save differential expression results
-    if (nrow(re_rna_results_t) > 0) {
-      output_file <- paste0(r_dir_files, "re_rna_differential_tumour", param_suffix, ".csv")
-      write.csv(re_rna_results_t, output_file, row.names = FALSE)
+    genes_passing <- unique(gene_sample_counts[[gene_col]])
+    cat("Genes with >=", minsample, "samples:", length(genes_passing), "\n")
 
-      # Filter genes by p_gene threshold
-      pathway_genes_t <- re_rna_results_t %>%
-        filter(p_value < params$p_gene) %>%
-        pull(gene) %>%
-        unique()
-
-      cat("Genes with p-value <", params$p_gene, ":", length(pathway_genes_t), "\n")
-
-      # Pathway analysis if enough genes
-      if (length(pathway_genes_t) >= 5) {
-        pathway_df_t <- data.frame(Gene_name = pathway_genes_t)
-
-        ora_re_rna_t <- tryCatch({
-          perform_ora_custom_cutoffs(pathway_df_t,
-                                    p_pathway = params$p_pathway,
-                                    q_pathway = params$q_pathway,
-                                    nsample_thresh = 0,
-                                    filter_exon = FALSE)
-        }, error = function(e) {
-          cat("Error in pathway analysis:", e$message, "\n")
-          NULL
-        })
-
-        if (!is.null(ora_re_rna_t) && nrow(as.data.frame(ora_re_rna_t)) > 0) {
-          n_pathways <- nrow(as.data.frame(ora_re_rna_t))
-          cat("✓ Found", n_pathways, "enriched pathways\n")
-
-          # Save pathway results
-          pathway_file <- paste0(r_dir_files, "re_rna_pathway_tumour", param_suffix, ".csv")
-          write.csv(as.data.frame(ora_re_rna_t), pathway_file, row.names = FALSE)
-
-          # Save gene list
-          gene_list_file <- paste0(r_dir_files, "re_rna_genes_tumour", param_suffix, ".txt")
-          writeLines(pathway_genes_t, gene_list_file)
-
-          # Create plots
-            tryCatch({
-              p_bar_re_rna_t <- barplot(ora_re_rna_t, showCategory = 20)
-              titled_print(p_bar_re_rna_t, "RE-RNA Pathway Barplot (Tumour)")
-              ggsave(paste0(plot_dir, "reg_element/re_rna_pathway_bar_tumour", param_suffix, ".png"),
-                     plot = p_bar_re_rna_t, width = 14, height = 9)
-            }, error = function(e) cat("Warning: Could not create barplot:", e$message, "\n"))
-
-            tryCatch({
-              p_dot_re_rna_t <- dotplot(ora_re_rna_t, showCategory = 20)
-              titled_print(p_dot_re_rna_t, "RE-RNA Pathway Dotplot (Tumour)")
-              ggsave(paste0(plot_dir, "reg_element/re_rna_pathway_dot_tumour", param_suffix, ".png"),
-                     plot = p_dot_re_rna_t, width = 14, height = 9)
-            }, error = function(e) cat("Warning: Could not create dotplot:", e$message, "\n"))
-
-            tryCatch({
-              p_cnet_re_rna_t <- cnetplot(ora_re_rna_t, showCategory = 10, colorEdge = TRUE, node_label = "category")
-              titled_print(p_cnet_re_rna_t, "RE-RNA Pathway Cnetplot (Tumour)")
-              ggsave(paste0(plot_dir, "reg_element/re_rna_pathway_cnet_tumour", param_suffix, ".png"),
-                     plot = p_cnet_re_rna_t, width = 14, height = 9)
-            }, error = function(e) cat("Warning: Could not create cnetplot:", e$message, "\n"))
-
-            tryCatch({
-              ora_re_rna_pairwise_t <- pairwise_termsim(ora_re_rna_t)
-              p_emap_re_rna_t <- emapplot(ora_re_rna_pairwise_t, showCategory = 20)
-              titled_print(p_emap_re_rna_t, "RE-RNA Pathway Emapplot (Tumour)")
-              ggsave(paste0(plot_dir, "reg_element/re_rna_pathway_emap_tumour", param_suffix, ".png"),
-                     plot = p_emap_re_rna_t, width = 14, height = 9)
-            }, error = function(e) cat("Warning: Could not create emapplot:", e$message, "\n"))
-
-          # Record sweep summary
-          sweep_summary <- rbind(sweep_summary, data.frame(
-            min_samples_per_group = params$min_samples_per_group,
-            p_gene = params$p_gene,
-            p_pathway = params$p_pathway,
-            q_pathway = params$q_pathway,
-            n_de_genes = nrow(re_rna_results_t),
-            n_filtered_genes = length(pathway_genes_t),
-            n_pathways = n_pathways,
-            stringsAsFactors = FALSE
-          ))
-        } else {
-          cat("No significant pathways found\n")
-          sweep_summary <- rbind(sweep_summary, data.frame(
-            min_samples_per_group = params$min_samples_per_group,
-            p_gene = params$p_gene,
-            p_pathway = params$p_pathway,
-            q_pathway = params$q_pathway,
-            n_de_genes = nrow(re_rna_results_t),
-            n_filtered_genes = length(pathway_genes_t),
-            n_pathways = 0,
+    if (length(genes_passing) < 5) {
+      cat("Too few genes. Skipping.\n")
+      # Add run summary entries for this minsample
+      for (mingene in MIN_GENE_VALUES) {
+        for (q_pathway in Q_PATHWAY_VALUES) {
+          pathways_str <- paste(sapply(databases, function(db) paste0(db, ":0")), collapse = ", ")
+          run_summary <<- rbind(run_summary, data.frame(
+            analysis_name = analysis_name,
+            analysis_type = "ora",
+            group_col = group_col,
+            any_pathway_significant = FALSE,
+            pathways_significant = pathways_str,
+            n_samples_per_group = n_samples_str,
+            genes_tested = length(genes_passing),
+            genes_significant = length(genes_passing),
+            enrichment_ran = FALSE,
+            minsample = minsample,
+            qgene = NA_real_,
+            mingene = mingene,
+            qpathway = q_pathway,
+            groups = paste(groups, collapse = ","),
+            glm_errors = NA_integer_,
+            posthoc_errors = NA_integer_,
+            posthoc_skipped = NA_character_,
             stringsAsFactors = FALSE
           ))
         }
-      } else {
-        cat("Not enough genes (< 5) for pathway analysis\n")
-        sweep_summary <- rbind(sweep_summary, data.frame(
-          min_samples_per_group = params$min_samples_per_group,
-          p_gene = params$p_gene,
-          p_pathway = params$p_pathway,
-          q_pathway = params$q_pathway,
-          n_de_genes = nrow(re_rna_results_t),
-          n_filtered_genes = length(pathway_genes_t),
-          n_pathways = NA,
+      }
+      next
+    }
+
+    # Assign genes to groups based on which group has highest incidence
+    gene_clusters <- assign_genes_to_groups_by_incidence(
+      te_data, genes_passing, group_col, groups, gene_col, actual_sample_col
+    )
+
+    # Run compareCluster ORA for each database
+    for (db in databases) {
+      db_dir <- paste0(analysis_base_dir, db, "/")
+      db_files_dir <- paste0(db_dir, "files/")
+      dir.create(db_files_dir, showWarnings = FALSE, recursive = TRUE)
+
+      cat("\n  Database:", db, "\n")
+      ora_result <- run_compareCluster_ora_by_db(gene_clusters, db, background_genes, pvalueCutoff = 1)
+
+      if (is.null(ora_result) || nrow(as.data.frame(ora_result)) == 0) {
+        cat("    No enriched terms found\n")
+        next
+      }
+
+      # Save full ORA result to {db}/files/
+      saveRDS(ora_result, paste0(db_files_dir, "ora_", db, "_", analysis_name,
+                                  "_minsample", minsample, "_full.rds"))
+      write.csv(as.data.frame(ora_result), paste0(db_files_dir, "ora_", db, "_", analysis_name,
+                                  "_minsample", minsample, "_full.csv"), row.names = FALSE)
+      cat("    Saved full result:", nrow(as.data.frame(ora_result)), "terms\n")
+
+      # Post-hoc filter by mingene and qpathway
+      for (mingene in MIN_GENE_VALUES) {
+        for (q_pathway in Q_PATHWAY_VALUES) {
+          ora_df <- as.data.frame(ora_result)
+          filtered_df <- ora_df %>% filter(Count >= mingene, qvalue < q_pathway)
+
+          pathways_sig <- nrow(filtered_df)
+
+          if (pathways_sig > 0) {
+            prefix <- paste0("ora_", db, "_", analysis_name, "_minsample", minsample,
+                             "_mingene", mingene, "_qpathway", q_pathway)
+
+            # Save filtered CSV to files/
+            write.csv(filtered_df, paste0(db_files_dir, prefix, ".csv"), row.names = FALSE)
+
+            # Create visualizations with filtered data
+            create_ora_visualizations(ora_result, filtered_df, te_data, db, prefix, db_dir,
+                                       gene_col, actual_sample_col)
+
+            cat("    Saved:", prefix, "(", pathways_sig, "terms)\n")
+          }
+        }
+      }
+    }
+
+    # Add run summary entries for this minsample (one row per mingene/qpathway combo)
+    pathway_counts_by_db <- list()
+    for (db in databases) {
+      db_files_dir <- paste0(analysis_base_dir, db, "/files/")
+      for (mingene in MIN_GENE_VALUES) {
+        for (q_pathway in Q_PATHWAY_VALUES) {
+          key <- paste(mingene, q_pathway, sep = "_")
+          csv_file <- paste0(db_files_dir, "ora_", db, "_", analysis_name,
+                             "_minsample", minsample, "_mingene", mingene, "_qpathway", q_pathway, ".csv")
+          if (file.exists(csv_file)) {
+            df <- read.csv(csv_file)
+            if (!db %in% names(pathway_counts_by_db)) pathway_counts_by_db[[db]] <- list()
+            pathway_counts_by_db[[db]][[key]] <- nrow(df)
+          } else {
+            if (!db %in% names(pathway_counts_by_db)) pathway_counts_by_db[[db]] <- list()
+            pathway_counts_by_db[[db]][[key]] <- 0
+          }
+        }
+      }
+    }
+
+    for (mingene in MIN_GENE_VALUES) {
+      for (q_pathway in Q_PATHWAY_VALUES) {
+        key <- paste(mingene, q_pathway, sep = "_")
+        pathway_counts <- sapply(databases, function(db) {
+          count <- pathway_counts_by_db[[db]][[key]]
+          if (is.null(count)) count <- 0
+          paste0(db, ":", count)
+        })
+        pathways_str <- paste(pathway_counts, collapse = ", ")
+
+        # Check if any pathway has count > 0
+        any_sig <- any(sapply(databases, function(db) {
+          count <- pathway_counts_by_db[[db]][[key]]
+          !is.null(count) && count > 0
+        }))
+
+        run_summary <<- rbind(run_summary, data.frame(
+          analysis_name = analysis_name,
+          analysis_type = "ora",
+          group_col = group_col,
+          any_pathway_significant = any_sig,
+          pathways_significant = pathways_str,
+          n_samples_per_group = n_samples_str,
+          genes_tested = length(genes_passing),
+          genes_significant = length(genes_passing),
+          enrichment_ran = TRUE,
+          minsample = minsample,
+          qgene = NA_real_,
+          mingene = mingene,
+          qpathway = q_pathway,
+          groups = paste(groups, collapse = ","),
+          glm_errors = NA_integer_,
+          posthoc_errors = NA_integer_,
+          posthoc_skipped = NA_character_,
           stringsAsFactors = FALSE
         ))
       }
+    }
+  }
+}
+
+#### GLM-BASED ORA FUNCTION ####
+# Problem 7: Run GLM ONCE per minsample with p_threshold=1.0, then filter by qgene afterward
+# Problem 6: Use combined database format for pathways_significant
+run_glm_ora_analysis_re <- function(te_data,
+                                     group_col,
+                                     groups,
+                                     analysis_name,
+                                     base_dir,
+                                     databases = DATABASES_TO_RUN,
+                                     background_genes = BACKGROUND_GENES,
+                                     gene_col = "gene_reg",
+                                     sample_col = "sample",
+                                     covariates = covar_med) {
+
+  cat("\n========================================\n")
+  cat("  GLM-ORA Analysis (RE):", analysis_name, "\n")
+  cat("========================================\n")
+  cat("Group column:", group_col, "\n")
+  cat("Groups:", paste(groups, collapse = ", "), "\n")
+
+  n_groups <- length(groups)
+
+  # Calculate sample counts per group for run summary
+  actual_sample_col <- if (sample_col %in% colnames(te_data)) sample_col else "sample"
+  sample_counts <- te_data %>%
+    filter(!is.na(.data[[group_col]])) %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(n = n_distinct(.data[[actual_sample_col]]), .groups = "drop")
+
+  # Convert to character to avoid factor level issues and build n_samples_str
+  sample_counts_vec <- setNames(sample_counts$n, as.character(sample_counts[[group_col]]))
+  n_samples_str <- paste(names(sample_counts_vec), sample_counts_vec, sep = ":", collapse = ", ")
+
+  # Create analysis-specific directories: analysis_name/files/ and analysis_name/db/
+  analysis_base_dir <- paste0(base_dir, analysis_name, "/")
+  files_dir <- paste0(analysis_base_dir, "files/")
+  dir.create(files_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Create database subdirectories for plots
+  for (db in databases) {
+    db_plot_dir <- paste0(analysis_base_dir, db, "/")
+    dir.create(db_plot_dir, showWarnings = FALSE, recursive = TRUE)
+  }
+
+  # Problem 7: Loop over minsample, run GLM ONCE with p_threshold=1.0
+  for (minsample in MIN_SAMPLES_VALUES) {
+    cat("\n--- minsample =", minsample, "---\n")
+
+    # Need to use sample.x column for RE data
+    te_data_renamed <- te_data
+    if (sample_col != "sample_id" && sample_col %in% colnames(te_data_renamed)) {
+      te_data_renamed$sample_id <- te_data_renamed[[sample_col]]
+    }
+
+    # Run GLM ONCE with p_threshold=1.0 to get ALL results
+    glm_result <- filter_genes_by_differential_incidence_glm(
+      te_data = te_data_renamed,
+      group_col = group_col,
+      groups = groups,
+      min_samples = minsample,
+      p_threshold = 1.0,  # Get ALL genes, filter by qgene later
+      gene_col = gene_col,
+      covariates = covariates
+    )
+
+    full_results <- glm_result$full_results
+    pairwise_results <- glm_result$pairwise
+
+    # Add comparison and enriched_in columns for 2-group comparisons
+    if (!is.null(full_results) && nrow(full_results) > 0 && n_groups == 2) {
+      full_results <- full_results %>%
+        mutate(
+          comparison = paste0(groups[1], "_vs_", groups[2]),
+          enriched_in = case_when(
+            z_value > 0 ~ groups[1],
+            z_value < 0 ~ groups[2],
+            TRUE ~ NA_character_
+          )
+        )
+    }
+
+    # Save full GLM results (before qgene filtering)
+    glm_results_file <- paste0(files_dir, "glm_", analysis_name,
+                               "_minsample", minsample, "_all.csv")
+    if (!is.null(full_results) && nrow(full_results) > 0) {
+      write.csv(full_results, glm_results_file, row.names = FALSE)
+      cat("  Saved all GLM results:", basename(glm_results_file), "(", nrow(full_results), "genes)\n")
+    }
+
+    # Extract metrics from GLM result
+    genes_tested <- glm_result$genes_attempted
+    glm_errors <- glm_result$glm_errors
+    posthoc_errors <- glm_result$posthoc_errors
+    posthoc_skipped <- glm_result$posthoc_skipped
+
+    # Now loop over qgene thresholds (Problem 7 - filter AFTER GLM)
+    for (qgene in Q_GENE_VALUES) {
+      cat("\n--- minsample =", minsample, ", qgene =", qgene, "---\n")
+
+      # Problem 7: Filter the already-computed full_results by qgene threshold
+      # Determine which column to use for filtering based on n_groups
+      if (n_groups >= 3) {
+        p_col <- "lrt_padj"
+      } else {
+        p_col <- "p_adj"
+      }
+
+      # Filter to significant genes
+      if (!is.null(full_results) && nrow(full_results) > 0 && p_col %in% colnames(full_results)) {
+        sig_results <- full_results %>% filter(.data[[p_col]] < qgene)
+        sig_genes <- unique(sig_results$gene)
+      } else {
+        sig_results <- data.frame()
+        sig_genes <- character(0)
+      }
+
+      # Save filtered GLM results for this qgene
+      glm_results_file <- paste0(files_dir, "glm_", analysis_name,
+                                 "_minsample", minsample, "_qgene", qgene, ".csv")
+      if (nrow(sig_results) > 0) {
+        write.csv(sig_results, glm_results_file, row.names = FALSE)
+        cat("  Saved GLM results:", basename(glm_results_file), "(", nrow(sig_results), "genes )\n")
+      } else {
+        # Save empty file with headers for 3+ group (LRT) or 2-group case
+        if (n_groups >= 3) {
+          empty_df <- data.frame(
+            gene = character(0), te_type = character(0), te_coordinates = character(0),
+            te_location_type = character(0), te_location = character(0), gene_features = character(0),
+            samples_with_te = integer(0), samples_with_te_names = character(0),
+            samples_without_te = integer(0), effect_direction = character(0),
+            lrt_pval = numeric(0), lrt_padj = numeric(0)
+          )
+        } else {
+          empty_df <- data.frame(
+            gene = character(0), te_type = character(0), te_coordinates = character(0),
+            te_location_type = character(0), te_location = character(0), gene_features = character(0),
+            samples_with_te = integer(0), samples_with_te_names = character(0),
+            samples_without_te = integer(0), effect_direction = character(0),
+            estimate = numeric(0), std_error = numeric(0), z_value = numeric(0),
+            p_value = numeric(0), p_adj = numeric(0)
+          )
+        }
+        write.csv(empty_df, glm_results_file, row.names = FALSE)
+        cat("  Saved GLM results:", basename(glm_results_file), "(0 genes - empty)\n")
+      }
+
+      genes_significant <- length(sig_genes)
+      ora_ran <- FALSE
+
+      # Problem 6: Initialize pathway_counts_by_db for combined format
+      pathway_counts_by_db <- list()
+      for (db in databases) {
+        pathway_counts_by_db[[db]] <- list()
+        for (mingene in MIN_GENE_VALUES) {
+          for (qpathway in Q_PATHWAY_VALUES) {
+            key <- paste(mingene, qpathway, sep = "_")
+            pathway_counts_by_db[[db]][[key]] <- 0
+          }
+        }
+      }
+
+      if (length(sig_genes) < 5) {
+        cat("Too few significant genes (", length(sig_genes), "). Skipping ORA.\n")
+
+        # Problem 6: Add combined run_summary entries
+        for (mingene in MIN_GENE_VALUES) {
+          for (qpathway in Q_PATHWAY_VALUES) {
+            key <- paste(mingene, qpathway, sep = "_")
+            pathway_counts <- sapply(databases, function(db) {
+              count <- pathway_counts_by_db[[db]][[key]]
+              if (is.null(count)) count <- 0
+              paste0(db, ":", count)
+            })
+            pathways_str <- paste(pathway_counts, collapse = ", ")
+
+            run_summary <<- rbind(run_summary, data.frame(
+              analysis_name = analysis_name,
+              analysis_type = "glm_ora",
+              group_col = group_col,
+              any_pathway_significant = FALSE,
+              pathways_significant = pathways_str,
+              n_samples_per_group = n_samples_str,
+              genes_tested = genes_tested,
+              genes_significant = genes_significant,
+              enrichment_ran = FALSE,
+              minsample = minsample,
+              qgene = qgene,
+              mingene = mingene,
+              qpathway = qpathway,
+              groups = paste(groups, collapse = ","),
+              glm_errors = glm_errors,
+              posthoc_errors = posthoc_errors,
+              posthoc_skipped = posthoc_skipped,
+              stringsAsFactors = FALSE
+            ))
+          }
+        }
+        next
+      }
+
+      cat("Running ORA on", length(sig_genes), "significant genes\n")
+      ora_ran <- TRUE
+
+      # Always use compareCluster for all analyses
+      cat("\n  === compareCluster ANALYSIS ===\n")
+
+        # Step 1: Assign genes to groups using post-hoc pairwise contrasts
+        if (!is.null(pairwise_results) && nrow(pairwise_results) > 0) {
+          cat("  Using post-hoc pairwise contrasts for gene assignment\n")
+          gene_assignment_df <- assign_genes_by_posthoc(pairwise_results, p_threshold = qgene)
+
+          # Save post-hoc results
+          posthoc_file <- paste0(files_dir, "glm_", analysis_name,
+                                 "_posthoc_minsample", minsample, "_qgene", qgene, ".csv")
+          write.csv(pairwise_results, posthoc_file, row.names = FALSE)
+          cat("  Saved post-hoc pairwise results:", basename(posthoc_file), "\n")
+
+          if (nrow(gene_assignment_df) > 0) {
+            # Convert to clusters format for compareCluster
+            gene_clusters <- gene_assignment_to_clusters(gene_assignment_df)
+
+            # Save gene assignment
+            gene_assign_file <- paste0(files_dir, "glm_", analysis_name,
+                                       "_gene_assignment_minsample", minsample, "_qgene", qgene, ".csv")
+            # Expand list column for saving
+            gene_assign_expanded <- gene_assignment_df %>%
+              mutate(assigned_groups_str = sapply(assigned_groups, paste, collapse = ";"))
+            write.csv(gene_assign_expanded[, c("gene", "assigned_groups_str")], gene_assign_file, row.names = FALSE)
+            cat("  Saved gene-group assignment:", basename(gene_assign_file), "(", nrow(gene_assignment_df), "genes)\n")
+
+            # Step 2: Run compareCluster for each database
+            for (db in databases) {
+              cat("\n  Database:", db, "(compareCluster)\n")
+              db_plot_dir <- paste0(analysis_base_dir, db, "/")
+
+              tryCatch({
+                # Run compareCluster based on database type
+                if (db == "GO_BP") {
+                  compare_result <- clusterProfiler::compareCluster(
+                    geneCluster = gene_clusters,
+                    fun = "enrichGO",
+                    OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+                    keyType = "SYMBOL",
+                    ont = "BP",
+                    universe = background_genes,
+                    pvalueCutoff = 1,
+                    qvalueCutoff = 1
+                  )
+                } else if (db == "Reactome") {
+                  # Convert to Entrez IDs for Reactome
+                  gene_clusters_entrez <- lapply(gene_clusters, function(genes) {
+                    ids <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, genes, "ENTREZID", "SYMBOL")
+                    ids[!is.na(ids)]
+                  })
+                  gene_clusters_entrez <- gene_clusters_entrez[sapply(gene_clusters_entrez, length) > 0]
+
+                  if (length(gene_clusters_entrez) >= 2) {
+                    compare_result <- clusterProfiler::compareCluster(
+                      geneCluster = gene_clusters_entrez,
+                      fun = "enrichPathway",
+                      organism = "human",
+                      pvalueCutoff = 1,
+                      qvalueCutoff = 1
+                    )
+                  } else {
+                    compare_result <- NULL
+                  }
+                } else if (db %in% c("Hallmark", "Oncogenic")) {
+                  # MSigDB databases
+                  msig_category <- if (db == "Hallmark") "H" else "C6"
+                  msig_db <- msigdbr::msigdbr(species = "Homo sapiens", category = msig_category)
+                  msig_t2g <- msig_db %>% dplyr::select(gs_name, gene_symbol)
+
+                  compare_result <- clusterProfiler::compareCluster(
+                    geneCluster = gene_clusters,
+                    fun = "enricher",
+                    TERM2GENE = msig_t2g,
+                    universe = background_genes,
+                    pvalueCutoff = 1,
+                    qvalueCutoff = 1
+                  )
+                } else {
+                  compare_result <- NULL
+                }
+
+                if (!is.null(compare_result) && nrow(as.data.frame(compare_result)) > 0) {
+                  # Save compareCluster result to files_dir (no database subdirectory)
+                  compare_rds <- paste0(files_dir, "glm_ora_pathway_", db, "_", analysis_name,
+                                        "_minsample", minsample, "_qgene", qgene, ".rds")
+                  saveRDS(compare_result, compare_rds)
+
+                  # Save as CSV
+                  compare_csv <- paste0(files_dir, "glm_ora_pathway_", db, "_", analysis_name,
+                                        "_minsample", minsample, "_qgene", qgene, ".csv")
+                  write.csv(as.data.frame(compare_result), compare_csv, row.names = FALSE)
+
+                  # Post-hoc filter by mingene and qpathway - collect counts in pathway_counts_by_db
+                  for (mingene in MIN_GENE_VALUES) {
+                    for (qpathway in Q_PATHWAY_VALUES) {
+                      compare_df <- as.data.frame(compare_result)
+                      filtered_df <- compare_df %>%
+                        filter(Count >= mingene, qvalue < qpathway)
+
+                      pathways_sig <- nrow(filtered_df)
+
+                      # Problem 6: Collect count in pathway_counts_by_db instead of adding per-db row
+                      key <- paste(mingene, qpathway, sep = "_")
+                      pathway_counts_by_db[[db]][[key]] <- pathways_sig
+
+                      if (pathways_sig == 0) next
+
+                      # Create output prefix with glm_ora_pathway_ naming
+                      prefix <- paste0("glm_ora_pathway_", db, "_", analysis_name,
+                                       "_minsample", minsample, "_qgene", qgene,
+                                       "_mingene", mingene, "_qpathway", qpathway)
+
+                      # Save filtered CSV to db_plot_dir/files/
+                      db_files_dir <- paste0(db_plot_dir, "files/")
+                      dir.create(db_files_dir, showWarnings = FALSE, recursive = TRUE)
+                      csv_file <- paste0(db_files_dir, prefix, ".csv")
+                      write.csv(filtered_df, csv_file, row.names = FALSE)
+
+                      # Create all ORA visualizations (7 types) with filtered data
+                      create_ora_visualizations(compare_result, filtered_df, te_data, db, prefix, db_plot_dir,
+                                                gene_col, actual_sample_col)
+
+                      cat("    Saved:", prefix, "(", pathways_sig, "terms)\n")
+                    }
+                  }
+                } else {
+                  # No results - set counts to 0 in pathway_counts_by_db
+                  for (mingene in MIN_GENE_VALUES) {
+                    for (qpathway in Q_PATHWAY_VALUES) {
+                      key <- paste(mingene, qpathway, sep = "_")
+                      pathway_counts_by_db[[db]][[key]] <- 0
+                    }
+                  }
+                  cat("    No enriched terms found\n")
+                }
+              }, error = function(e) {
+                cat("    Error running compareCluster for", db, ":", e$message, "\n")
+                # Set counts to 0 in pathway_counts_by_db on error
+                for (mingene in MIN_GENE_VALUES) {
+                  for (qpathway in Q_PATHWAY_VALUES) {
+                    key <- paste(mingene, qpathway, sep = "_")
+                    pathway_counts_by_db[[db]][[key]] <- 0
+                  }
+                }
+              })
+            }
+          } else {
+            cat("  No genes could be assigned to groups from post-hoc results\n")
+            # pathway_counts_by_db already initialized to 0
+          }
+        } else {
+          cat("  No post-hoc pairwise results available\n")
+          # pathway_counts_by_db already initialized to 0
+        }
+
+        # Problem 6: Add combined run_summary entries for 3+ groups
+        for (mingene in MIN_GENE_VALUES) {
+          for (qpathway in Q_PATHWAY_VALUES) {
+            key <- paste(mingene, qpathway, sep = "_")
+            pathway_counts <- sapply(databases, function(db) {
+              count <- pathway_counts_by_db[[db]][[key]]
+              if (is.null(count)) count <- 0
+              paste0(db, ":", count)
+            })
+            pathways_str <- paste(pathway_counts, collapse = ", ")
+
+            # Check if any pathway has count > 0
+            any_sig <- any(sapply(databases, function(db) {
+              count <- pathway_counts_by_db[[db]][[key]]
+              !is.null(count) && count > 0
+            }))
+
+            run_summary <<- rbind(run_summary, data.frame(
+              analysis_name = analysis_name,
+              analysis_type = "glm_ora",
+              group_col = group_col,
+              any_pathway_significant = any_sig,
+              pathways_significant = pathways_str,
+              n_samples_per_group = n_samples_str,
+              genes_tested = genes_tested,
+              genes_significant = genes_significant,
+              enrichment_ran = ora_ran,
+              minsample = minsample,
+              qgene = qgene,
+              mingene = mingene,
+              qpathway = qpathway,
+              groups = paste(groups, collapse = ","),
+              glm_errors = glm_errors,
+              posthoc_errors = posthoc_errors,
+              posthoc_skipped = posthoc_skipped,
+              stringsAsFactors = FALSE
+            ))
+          }
+        }
+    }
+  }
+}
+
+#### GLM-BASED GSEA FUNCTION ####
+# Uses z-statistic from GLM as ranking metric for Gene Set Enrichment Analysis
+run_glm_gsea_analysis_re <- function(te_data,
+                                      group_col,
+                                      groups,
+                                      analysis_name,
+                                      base_dir,
+                                      databases = DATABASES_TO_RUN,
+                                      gene_col = "gene_reg",
+                                      sample_col = "sample",
+                                      covariates = covar_med) {
+
+  cat("\n========================================\n")
+  cat("  GLM-GSEA Analysis (RE):", analysis_name, "\n")
+  cat("========================================\n")
+  cat("Group column:", group_col, "\n")
+  cat("Groups:", paste(groups, collapse = ", "), "\n")
+
+  n_groups <- length(groups)
+
+  # Calculate sample counts per group for run summary
+  actual_sample_col <- if (sample_col %in% colnames(te_data)) sample_col else "sample"
+  sample_counts <- te_data %>%
+    filter(!is.na(.data[[group_col]])) %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(n = n_distinct(.data[[actual_sample_col]]), .groups = "drop")
+  sample_counts_vec <- setNames(sample_counts$n, as.character(sample_counts[[group_col]]))
+  n_samples_str <- paste(names(sample_counts_vec), sample_counts_vec, sep = ":", collapse = ", ")
+
+  # Create analysis-specific directories
+  analysis_base_dir <- paste0(base_dir, analysis_name, "/")
+  files_dir <- paste0(analysis_base_dir, "files/")
+  dir.create(files_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Create database subdirectories for plots
+  for (db in databases) {
+    db_plot_dir <- paste0(analysis_base_dir, db, "/")
+    dir.create(db_plot_dir, showWarnings = FALSE, recursive = TRUE)
+  }
+
+  # Loop over minsample, run GLM ONCE with p_threshold=1.0
+  for (minsample in MIN_SAMPLES_VALUES) {
+    cat("\n--- minsample =", minsample, "---\n")
+
+    # Need to use sample.x column for RE data
+    te_data_renamed <- te_data
+    if (sample_col != "sample_id" && sample_col %in% colnames(te_data_renamed)) {
+      te_data_renamed$sample_id <- te_data_renamed[[sample_col]]
+    }
+
+    # Run GLM ONCE with p_threshold=1.0 to get ALL results
+    glm_result <- filter_genes_by_differential_incidence_glm(
+      te_data = te_data_renamed,
+      group_col = group_col,
+      groups = groups,
+      min_samples = minsample,
+      p_threshold = 1.0,
+      gene_col = gene_col,
+      covariates = covariates
+    )
+
+    full_results <- glm_result$full_results
+    pairwise_results <- glm_result$pairwise
+
+    # Add comparison and enriched_in columns for 2-group comparisons
+    if (!is.null(full_results) && nrow(full_results) > 0 && n_groups == 2) {
+      full_results <- full_results %>%
+        mutate(
+          comparison = paste0(groups[1], "_vs_", groups[2]),
+          enriched_in = case_when(
+            z_value > 0 ~ groups[1],
+            z_value < 0 ~ groups[2],
+            TRUE ~ NA_character_
+          )
+        )
+    }
+
+    # Save full GLM results
+    glm_results_file <- paste0(files_dir, "glm_", analysis_name,
+                               "_minsample", minsample, "_all.csv")
+    if (!is.null(full_results) && nrow(full_results) > 0) {
+      write.csv(full_results, glm_results_file, row.names = FALSE)
+      cat("  Saved all GLM results:", basename(glm_results_file), "(", nrow(full_results), "genes)\n")
+    }
+
+    # Extract metrics from GLM result
+    genes_tested <- glm_result$genes_attempted
+    glm_errors <- glm_result$glm_errors
+    posthoc_errors <- glm_result$posthoc_errors
+    posthoc_skipped <- glm_result$posthoc_skipped
+
+    # Initialize pathway_counts_by_db for combined format
+    pathway_counts_by_db <- list()
+    for (db in databases) {
+      pathway_counts_by_db[[db]] <- list()
+      for (qpathway in Q_PATHWAY_VALUES) {
+        pathway_counts_by_db[[db]][[as.character(qpathway)]] <- 0
+      }
+    }
+
+    gsea_ran <- FALSE
+
+    # Create gene list for GSEA using z-statistic
+    if (is.null(full_results) || nrow(full_results) == 0) {
+      cat("  No GLM results available. Skipping GSEA.\n")
+
+      # Add run_summary entries (no qgene, no mingene for GSEA)
+      for (qpathway in Q_PATHWAY_VALUES) {
+        pathway_counts <- sapply(databases, function(db) paste0(db, ":0"))
+        pathways_str <- paste(pathway_counts, collapse = ", ")
+
+        run_summary <<- rbind(run_summary, data.frame(
+          analysis_name = analysis_name,
+          analysis_type = "glm_gsea",
+          group_col = group_col,
+          any_pathway_significant = FALSE,
+          pathways_significant = pathways_str,
+          n_samples_per_group = n_samples_str,
+          genes_tested = genes_tested,
+          genes_significant = NA_integer_,
+          enrichment_ran = FALSE,
+          minsample = minsample,
+          qgene = NA_real_,
+          mingene = NA_integer_,
+          qpathway = qpathway,
+          groups = paste(groups, collapse = ","),
+          glm_errors = glm_errors,
+          posthoc_errors = posthoc_errors,
+          posthoc_skipped = posthoc_skipped,
+          stringsAsFactors = FALSE
+        ))
+      }
+      next
+    }
+
+    # For 2-group comparison: use z_value column
+    # For 3+ group comparison: need to use pairwise results
+    if (n_groups == 2) {
+      # Use z_value from main results
+      if (!"z_value" %in% colnames(full_results)) {
+        cat("  No z_value column found. Skipping GSEA.\n")
+        next
+      }
+
+      # Create named vector: gene names as names, z-values as values
+      gene_list <- setNames(full_results$z_value, full_results$gene)
+      gene_list <- gene_list[!is.na(gene_list)]
+      gene_list <- sort(gene_list, decreasing = TRUE)
+
+      cat("  Gene list for GSEA:", length(gene_list), "genes\n")
+
+      # Run GSEA for each database
+      for (db in databases) {
+        cat("\n  Database:", db, "(GSEA)\n")
+        db_plot_dir <- paste0(analysis_base_dir, db, "/")
+        db_files_dir <- paste0(db_plot_dir, "files/")
+        dir.create(db_files_dir, showWarnings = FALSE, recursive = TRUE)
+
+        tryCatch({
+          gsea_result <- NULL
+
+          if (db == "GO_BP") {
+            gsea_result <- clusterProfiler::gseGO(
+              geneList = gene_list,
+              OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+              keyType = "SYMBOL",
+              ont = "BP",
+              minGSSize = 10,
+              maxGSSize = 500,
+              pvalueCutoff = 1,
+              eps = 0
+            )
+          } else if (db == "Reactome") {
+            # Convert gene list to Entrez IDs
+            gene_ids <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db,
+                                               keys = names(gene_list),
+                                               column = "ENTREZID",
+                                               keytype = "SYMBOL",
+                                               multiVals = "first")
+            gene_list_entrez <- gene_list[!is.na(gene_ids)]
+            names(gene_list_entrez) <- gene_ids[!is.na(gene_ids)]
+
+            if (length(gene_list_entrez) >= 10) {
+              gsea_result <- ReactomePA::gsePathway(
+                geneList = gene_list_entrez,
+                organism = "human",
+                minGSSize = 10,
+                maxGSSize = 500,
+                pvalueCutoff = 1,
+                eps = 0
+              )
+            }
+          } else if (db %in% c("Hallmark", "Oncogenic")) {
+            msig_category <- if (db == "Hallmark") "H" else "C6"
+            msig_db <- msigdbr::msigdbr(species = "Homo sapiens", category = msig_category)
+            msig_t2g <- msig_db %>% dplyr::select(gs_name, gene_symbol)
+
+            gsea_result <- clusterProfiler::GSEA(
+              geneList = gene_list,
+              TERM2GENE = msig_t2g,
+              minGSSize = 10,
+              maxGSSize = 500,
+              pvalueCutoff = 1,
+              eps = 0
+            )
+          }
+
+          if (!is.null(gsea_result) && nrow(as.data.frame(gsea_result)) > 0) {
+            gsea_ran <- TRUE
+
+            # Save full GSEA result
+            saveRDS(gsea_result, paste0(db_files_dir, "glm_gsea_pathway_", db, "_", analysis_name,
+                                        "_minsample", minsample, "_full.rds"))
+            write.csv(as.data.frame(gsea_result), paste0(db_files_dir, "glm_gsea_pathway_", db, "_", analysis_name,
+                                        "_minsample", minsample, "_full.csv"), row.names = FALSE)
+
+            # Filter by qpathway
+            for (qpathway in Q_PATHWAY_VALUES) {
+              gsea_df <- as.data.frame(gsea_result)
+              filtered_df <- gsea_df %>% filter(qvalue < qpathway)
+              pathways_sig <- nrow(filtered_df)
+
+              pathway_counts_by_db[[db]][[as.character(qpathway)]] <- pathways_sig
+
+              if (pathways_sig > 0) {
+                prefix <- paste0("glm_gsea_pathway_", db, "_", analysis_name,
+                                 "_minsample", minsample, "_qpathway", qpathway)
+
+                # Save filtered CSV
+                write.csv(filtered_df, paste0(db_files_dir, prefix, ".csv"), row.names = FALSE)
+
+                # Create GSEA visualizations
+                group1_label <- groups[1]
+                group2_label <- groups[2]
+
+                # Dot plot with up/down split
+                tryCatch({
+                  p_dot <- enrichplot::dotplot(gsea_result,
+                                                showCategory = min(20, pathways_sig),
+                                                split = ".sign") +
+                    ggplot2::facet_grid(~.sign, labeller = ggplot2::labeller(.sign = c(
+                      "activated" = paste0("Up in ", group1_label),
+                      "suppressed" = paste0("Up in ", group2_label)
+                    ))) +
+                    ggplot2::theme(strip.text = ggplot2::element_text(size = 10))
+                  ggsave(paste0(db_plot_dir, prefix, "_dot.png"), p_dot, width = 14, height = 8)
+                }, error = function(e) cat("    Dot plot error:", e$message, "\n"))
+
+                # Ridge plot
+                if (pathways_sig >= 3) {
+                  tryCatch({
+                    p_ridge <- enrichplot::ridgeplot(gsea_result, showCategory = min(20, pathways_sig))
+                    ggsave(paste0(db_plot_dir, prefix, "_ridge.png"), p_ridge, width = 10, height = 10)
+                  }, error = function(e) cat("    Ridge plot error:", e$message, "\n"))
+                }
+
+                # GSEA running score plot for top pathways
+                top_pathways <- head(filtered_df$ID, 4)
+                for (i in seq_along(top_pathways)) {
+                  pathway_id <- top_pathways[i]
+                  tryCatch({
+                    p_gsea <- enrichplot::gseaplot2(gsea_result, geneSetID = pathway_id)
+                    ggsave(paste0(db_plot_dir, prefix, "_gsea_", i, ".png"), p_gsea, width = 10, height = 6)
+                  }, error = function(e) cat("    gseaplot2 error for", pathway_id, ":", e$message, "\n"))
+                }
+
+                cat("    Saved:", prefix, "(", pathways_sig, "terms)\n")
+              }
+            }
+          } else {
+            cat("    No enriched terms found\n")
+          }
+        }, error = function(e) {
+          cat("    Error running GSEA for", db, ":", e$message, "\n")
+        })
+      }
     } else {
-      cat("No differential expression results for this parameter combination\n")
-      sweep_summary <- rbind(sweep_summary, data.frame(
-        min_samples_per_group = params$min_samples_per_group,
-        p_gene = params$p_gene,
-        p_pathway = params$p_pathway,
-        q_pathway = params$q_pathway,
-        n_de_genes = 0,
-        n_filtered_genes = 0,
-        n_pathways = NA,
+      # 3+ groups: run GSEA for each pairwise contrast
+      if (!is.null(pairwise_results) && nrow(pairwise_results) > 0) {
+        # Save post-hoc pairwise results (same as GLM ORA does)
+        posthoc_file <- paste0(files_dir, "glm_", analysis_name,
+                               "_posthoc_minsample", minsample, ".csv")
+        write.csv(pairwise_results, posthoc_file, row.names = FALSE)
+        cat("  Saved post-hoc pairwise results:", basename(posthoc_file), "\n")
+
+        # Get unique contrasts
+        contrasts <- unique(pairwise_results$contrast)
+        cat("  Running GSEA for", length(contrasts), "pairwise contrasts\n")
+
+        for (contrast_name in contrasts) {
+          cat("\n  Contrast:", contrast_name, "\n")
+
+          contrast_results <- pairwise_results %>% filter(contrast == contrast_name)
+
+          # Use z.ratio as the ranking metric (from emmeans)
+          if (!"z.ratio" %in% colnames(contrast_results)) {
+            cat("    No z.ratio column found. Skipping.\n")
+            next
+          }
+
+          gene_list <- setNames(contrast_results$z.ratio, contrast_results$gene)
+          gene_list <- gene_list[!is.na(gene_list)]
+          gene_list <- sort(gene_list, decreasing = TRUE)
+
+          if (length(gene_list) < 10) {
+            cat("    Too few genes (", length(gene_list), "). Skipping.\n")
+            next
+          }
+
+          # Clean contrast name for file naming
+          contrast_clean <- gsub(" - ", "_vs_", contrast_name)
+          contrast_clean <- gsub("[^a-zA-Z0-9_]", "", contrast_clean)
+
+          for (db in databases) {
+            cat("    Database:", db, "\n")
+            db_plot_dir <- paste0(analysis_base_dir, db, "/")
+            db_files_dir <- paste0(db_plot_dir, "files/")
+            dir.create(db_files_dir, showWarnings = FALSE, recursive = TRUE)
+
+            tryCatch({
+              gsea_result <- NULL
+
+              if (db == "GO_BP") {
+                gsea_result <- clusterProfiler::gseGO(
+                  geneList = gene_list,
+                  OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+                  keyType = "SYMBOL",
+                  ont = "BP",
+                  minGSSize = 10,
+                  maxGSSize = 500,
+                  pvalueCutoff = 1,
+                  eps = 0
+                )
+              } else if (db == "Reactome") {
+                gene_ids <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db,
+                                                   keys = names(gene_list),
+                                                   column = "ENTREZID",
+                                                   keytype = "SYMBOL",
+                                                   multiVals = "first")
+                gene_list_entrez <- gene_list[!is.na(gene_ids)]
+                names(gene_list_entrez) <- gene_ids[!is.na(gene_ids)]
+
+                if (length(gene_list_entrez) >= 10) {
+                  gsea_result <- ReactomePA::gsePathway(
+                    geneList = gene_list_entrez,
+                    organism = "human",
+                    minGSSize = 10,
+                    maxGSSize = 500,
+                    pvalueCutoff = 1,
+                    eps = 0
+                  )
+                }
+              } else if (db %in% c("Hallmark", "Oncogenic")) {
+                msig_category <- if (db == "Hallmark") "H" else "C6"
+                msig_db <- msigdbr::msigdbr(species = "Homo sapiens", category = msig_category)
+                msig_t2g <- msig_db %>% dplyr::select(gs_name, gene_symbol)
+
+                gsea_result <- clusterProfiler::GSEA(
+                  geneList = gene_list,
+                  TERM2GENE = msig_t2g,
+                  minGSSize = 10,
+                  maxGSSize = 500,
+                  pvalueCutoff = 1,
+                  eps = 0
+                )
+              }
+
+              if (!is.null(gsea_result) && nrow(as.data.frame(gsea_result)) > 0) {
+                gsea_ran <- TRUE
+
+                # Save full GSEA result for this contrast
+                saveRDS(gsea_result, paste0(db_files_dir, "glm_gsea_pathway_", db, "_", analysis_name,
+                                            "_", contrast_clean, "_minsample", minsample, "_full.rds"))
+                write.csv(as.data.frame(gsea_result), paste0(db_files_dir, "glm_gsea_pathway_", db, "_", analysis_name,
+                                            "_", contrast_clean, "_minsample", minsample, "_full.csv"), row.names = FALSE)
+
+                # Filter by qpathway and count
+                for (qpathway in Q_PATHWAY_VALUES) {
+                  gsea_df <- as.data.frame(gsea_result)
+                  filtered_df <- gsea_df %>% filter(qvalue < qpathway)
+                  pathways_sig <- nrow(filtered_df)
+
+                  # Add to counts (sum across contrasts)
+                  current <- pathway_counts_by_db[[db]][[as.character(qpathway)]]
+                  pathway_counts_by_db[[db]][[as.character(qpathway)]] <- current + pathways_sig
+
+                  if (pathways_sig > 0) {
+                    prefix <- paste0("glm_gsea_pathway_", db, "_", analysis_name,
+                                     "_", contrast_clean, "_minsample", minsample, "_qpathway", qpathway)
+
+                    write.csv(filtered_df, paste0(db_files_dir, prefix, ".csv"), row.names = FALSE)
+
+                    # Create GSEA visualizations
+                    contrast_parts <- strsplit(contrast_name, " - ")[[1]]
+                    group1_label <- trimws(contrast_parts[1])
+                    group2_label <- if(length(contrast_parts) > 1) trimws(contrast_parts[2]) else "Reference"
+
+                    # Dot plot with up/down split
+                    tryCatch({
+                      p_dot <- enrichplot::dotplot(gsea_result,
+                                                    showCategory = min(20, pathways_sig),
+                                                    split = ".sign") +
+                        ggplot2::facet_grid(~.sign, labeller = ggplot2::labeller(.sign = c(
+                          "activated" = paste0("Up in ", group1_label),
+                          "suppressed" = paste0("Up in ", group2_label)
+                        ))) +
+                        ggplot2::theme(strip.text = ggplot2::element_text(size = 10))
+                      ggsave(paste0(db_plot_dir, prefix, "_dot.png"), p_dot, width = 14, height = 8)
+                    }, error = function(e) cat("      Dot plot error:", e$message, "\n"))
+
+                    # Ridge plot
+                    if (pathways_sig >= 3) {
+                      tryCatch({
+                        p_ridge <- enrichplot::ridgeplot(gsea_result, showCategory = min(20, pathways_sig))
+                        ggsave(paste0(db_plot_dir, prefix, "_ridge.png"), p_ridge, width = 10, height = 10)
+                      }, error = function(e) cat("      Ridge plot error:", e$message, "\n"))
+                    }
+
+                    # GSEA running score plot for top pathways
+                    top_pathways <- head(filtered_df$ID, 4)
+                    for (i in seq_along(top_pathways)) {
+                      pathway_id <- top_pathways[i]
+                      tryCatch({
+                        p_gsea <- enrichplot::gseaplot2(gsea_result, geneSetID = pathway_id)
+                        ggsave(paste0(db_plot_dir, prefix, "_gsea_", i, ".png"), p_gsea, width = 10, height = 6)
+                      }, error = function(e) cat("      gseaplot2 error for", pathway_id, ":", e$message, "\n"))
+                    }
+                  }
+                }
+              }
+            }, error = function(e) {
+              cat("      Error running GSEA:", e$message, "\n")
+            })
+          }
+        }
+      } else {
+        cat("  No pairwise results available for GSEA\n")
+      }
+    }
+
+    # Add run_summary entries (one per qpathway)
+    for (qpathway in Q_PATHWAY_VALUES) {
+      pathway_counts <- sapply(databases, function(db) {
+        count <- pathway_counts_by_db[[db]][[as.character(qpathway)]]
+        if (is.null(count)) count <- 0
+        paste0(db, ":", count)
+      })
+      pathways_str <- paste(pathway_counts, collapse = ", ")
+
+      # Check if any pathway has count > 0
+      any_sig <- any(sapply(databases, function(db) {
+        count <- pathway_counts_by_db[[db]][[as.character(qpathway)]]
+        !is.null(count) && count > 0
+      }))
+
+      run_summary <<- rbind(run_summary, data.frame(
+        analysis_name = analysis_name,
+        analysis_type = "glm_gsea",
+        group_col = group_col,
+        any_pathway_significant = any_sig,
+        pathways_significant = pathways_str,
+        n_samples_per_group = n_samples_str,
+        genes_tested = genes_tested,
+        genes_significant = NA_integer_,
+        enrichment_ran = gsea_ran,
+        minsample = minsample,
+        qgene = NA_real_,
+        mingene = NA_integer_,
+        qpathway = qpathway,
+        groups = paste(groups, collapse = ","),
+        glm_errors = glm_errors,
+        posthoc_errors = posthoc_errors,
+        posthoc_skipped = posthoc_skipped,
         stringsAsFactors = FALSE
       ))
     }
   }
+}
 
-  # Save sweep summary
-  if (nrow(sweep_summary) > 0) {
-    summary_file <- paste0(r_dir_files, "re_rna_sweep_tumour_summary.csv")
-    write.csv(sweep_summary, summary_file, row.names = FALSE)
-    cat("\n✓ Parameter sweep complete! Summary saved to:", summary_file, "\n")
-    cat("\nTop 5 parameter combinations by number of pathways:\n")
-    print(head(sweep_summary[order(-sweep_summary$n_pathways), ], 5))
+#### RE PATHWAY ANALYSIS 1: TP53 STATUS ####
+write_output(quote(NULL), "RE Pathway Analysis - TP53 Status (GLM)")
+
+cat("Dataset: te_aff_re_split_t\n")
+cat("Samples:", length(unique(te_aff_re_split_t$sample_id)), "\n")
+tp53_groups <- unique(te_aff_re_split_t$TP53_status)
+tp53_groups <- tp53_groups[!is.na(tp53_groups)]
+cat("TP53 groups:", paste(tp53_groups, collapse = ", "), "\n\n")
+
+if (length(tp53_groups) >= 2) {
+  # Simple ORA
+  run_simple_ora_analysis_re(
+    te_data = te_aff_re_split_t,
+    group_col = "TP53_status",
+    groups = tp53_groups,
+    analysis_name = "tp53_status",
+    base_dir = ora_dir
+  )
+  # GLM-ORA
+  run_glm_ora_analysis_re(
+    te_data = te_aff_re_split_t,
+    group_col = "TP53_status",
+    groups = tp53_groups,
+    analysis_name = "tp53_status",
+    base_dir = glm_ora_dir
+  )
+  # GLM-GSEA
+  run_glm_gsea_analysis_re(
+    te_data = te_aff_re_split_t,
+    group_col = "TP53_status",
+    groups = tp53_groups,
+    analysis_name = "tp53_status",
+    base_dir = glm_gsea_dir
+  )
+} else {
+  cat("Not enough TP53 groups. Skipping.\n")
+}
+
+#### RE PATHWAY ANALYSIS 2: TP53 3-LEVEL ####
+write_output(quote(NULL), "RE Pathway Analysis - TP53 3-Level (GLM + LRT)")
+
+cat("Dataset: te_aff_re_split_t (TP53_3level)\n")
+
+te_aff_re_3level <- te_aff_re_split_t %>%
+  filter(!is.na(TP53_3level))
+
+if (nrow(te_aff_re_3level) > 0) {
+  tp53_3level_groups <- unique(te_aff_re_3level$TP53_3level)
+  tp53_3level_groups <- tp53_3level_groups[!is.na(tp53_3level_groups)]
+  cat("TP53_3level groups:", paste(tp53_3level_groups, collapse = ", "), "\n")
+
+  if (length(tp53_3level_groups) >= 2) {
+    # Simple ORA
+    run_simple_ora_analysis_re(
+      te_data = te_aff_re_3level,
+      group_col = "TP53_3level",
+      groups = tp53_3level_groups,
+      analysis_name = "tp53_3level",
+      base_dir = ora_dir
+    )
+    # GLM-ORA
+    run_glm_ora_analysis_re(
+      te_data = te_aff_re_3level,
+      group_col = "TP53_3level",
+      groups = tp53_3level_groups,
+      analysis_name = "tp53_3level",
+      base_dir = glm_ora_dir
+    )
+    # GLM-GSEA
+    run_glm_gsea_analysis_re(
+      te_data = te_aff_re_3level,
+      group_col = "TP53_3level",
+      groups = tp53_3level_groups,
+      analysis_name = "tp53_3level",
+      base_dir = glm_gsea_dir
+    )
+  } else {
+    cat("Not enough TP53_3level groups. Skipping.\n")
   }
 }
 
+#### RE PATHWAY ANALYSIS 3: KICS TUMOR TYPE ####
+write_output(quote(NULL), "RE Pathway Analysis - KICS by Tumor Type (GLM + LRT)")
 
+if ("tumor_type" %in% colnames(te_kics_re_split_t)) {
+  te_kics_re_tumor <- te_kics_re_split_t %>%
+    filter(!is.na(tumor_type) & tumor_type != "" & tumor_type != "U")
 
-cat("✓ Script completed successfully\n")
+  # Filter to tumor types with >= 3 samples
+  tumor_type_counts <- table(te_kics_re_tumor$tumor_type)
+  valid_tumor_types <- names(tumor_type_counts[tumor_type_counts >= 3])
+  cat("Tumor types with >= 3 samples:", paste(valid_tumor_types, collapse = ", "), "\n")
+
+  if (length(valid_tumor_types) >= 2) {
+    te_kics_re_tumor <- te_kics_re_tumor %>%
+      filter(tumor_type %in% valid_tumor_types)
+
+    # Simple ORA
+    run_simple_ora_analysis_re(
+      te_data = te_kics_re_tumor,
+      group_col = "tumor_type",
+      groups = valid_tumor_types,
+      analysis_name = "kics_tumor_type",
+      base_dir = ora_dir
+    )
+    # GLM-ORA
+    run_glm_ora_analysis_re(
+      te_data = te_kics_re_tumor,
+      group_col = "tumor_type",
+      groups = valid_tumor_types,
+      analysis_name = "kics_tumor_type",
+      base_dir = glm_ora_dir,
+      covariates = covar_no_tumour_type
+    )
+    # GLM-GSEA
+    run_glm_gsea_analysis_re(
+      te_data = te_kics_re_tumor,
+      group_col = "tumor_type",
+      groups = valid_tumor_types,
+      analysis_name = "kics_tumor_type",
+      base_dir = glm_gsea_dir,
+      covariates = covar_no_tumour_type
+    )
+  } else {
+    cat("Not enough tumor types with >= 3 samples. Skipping.\n")
+  }
+}
+
+#### RE PATHWAY ANALYSIS 4: KICS BY ANCESTRY (NEW) ####
+write_output(quote(NULL), "RE Pathway Analysis - KICS by Ancestry (GLM + LRT)")
+
+if ("predicted_ancestry_thres" %in% colnames(te_kics_re_split_t)) {
+  ancestries <- unique(te_kics_re_split_t$predicted_ancestry_thres)
+  ancestries <- ancestries[!is.na(ancestries)]
+  cat("Ancestries:", paste(ancestries, collapse = ", "), "\n")
+
+  # Only run if we have enough groups with samples
+  ancestry_counts <- table(te_kics_re_split_t$predicted_ancestry_thres)
+  valid_ancestries <- names(ancestry_counts[ancestry_counts >= 10])
+
+  if (length(valid_ancestries) >= 2) {
+    te_kics_re_ancestry <- te_kics_re_split_t %>%
+      filter(predicted_ancestry_thres %in% valid_ancestries)
+
+    # Simple ORA
+    run_simple_ora_analysis_re(
+      te_data = te_kics_re_ancestry,
+      group_col = "predicted_ancestry_thres",
+      groups = valid_ancestries,
+      analysis_name = "kics_ancestry",
+      base_dir = ora_dir
+    )
+    # GLM-ORA
+    run_glm_ora_analysis_re(
+      te_data = te_kics_re_ancestry,
+      group_col = "predicted_ancestry_thres",
+      groups = valid_ancestries,
+      analysis_name = "kics_ancestry",
+      base_dir = glm_ora_dir,
+      covariates = covar_no_ancestry
+    )
+    # GLM-GSEA
+    run_glm_gsea_analysis_re(
+      te_data = te_kics_re_ancestry,
+      group_col = "predicted_ancestry_thres",
+      groups = valid_ancestries,
+      analysis_name = "kics_ancestry",
+      base_dir = glm_gsea_dir,
+      covariates = covar_no_ancestry
+    )
+  } else {
+    cat("Not enough ancestry groups with >=10 samples. Skipping.\n")
+  }
+}
+
+#### RE PATHWAY ANALYSIS 5: LFS BY COHORT (NEW) ####
+write_output(quote(NULL), "RE Pathway Analysis - LFS by Cohort (GLM + LRT)")
+
+if ("cohort" %in% colnames(te_lfs_re_split_t)) {
+  cohorts <- unique(te_lfs_re_split_t$cohort)
+  cohorts <- cohorts[!is.na(cohorts)]
+  cat("Cohorts:", paste(cohorts, collapse = ", "), "\n")
+
+  if (length(cohorts) >= 2) {
+    # Simple ORA
+    run_simple_ora_analysis_re(
+      te_data = te_lfs_re_split_t,
+      group_col = "cohort",
+      groups = cohorts,
+      analysis_name = "lfs_cohort",
+      base_dir = ora_dir
+    )
+    # GLM-ORA
+    run_glm_ora_analysis_re(
+      te_data = te_lfs_re_split_t,
+      group_col = "cohort",
+      groups = cohorts,
+      analysis_name = "lfs_cohort",
+      base_dir = glm_ora_dir
+    )
+    # GLM-GSEA
+    run_glm_gsea_analysis_re(
+      te_data = te_lfs_re_split_t,
+      group_col = "cohort",
+      groups = cohorts,
+      analysis_name = "lfs_cohort",
+      base_dir = glm_gsea_dir
+    )
+  }
+}
+
+#### RE PATHWAY ANALYSIS 6: TAYLOR BY SUBTYPE ####
+write_output(quote(NULL), "RE Pathway Analysis - Taylor by Subtype")
+
+if (!is.null(te_taylor_re_split_t) && nrow(te_taylor_re_split_t) > 0) {
+  if ("tumor_type_subclass" %in% colnames(te_taylor_re_split_t)) {
+    # Filter to subtypes with >= 3 samples
+    subtype_counts <- table(te_taylor_re_split_t$tumor_type_subclass)
+    valid_subtypes <- names(subtype_counts[subtype_counts >= 3])
+    cat("Taylor subtypes with >= 3 samples:", paste(valid_subtypes, collapse = ", "), "\n")
+
+    if (length(valid_subtypes) >= 2) {
+      te_taylor_re_subtype <- te_taylor_re_split_t %>%
+        filter(tumor_type_subclass %in% valid_subtypes)
+
+      # Simple ORA
+      run_simple_ora_analysis_re(
+        te_data = te_taylor_re_subtype,
+        group_col = "tumor_type_subclass",
+        groups = valid_subtypes,
+        analysis_name = "taylor_subtype",
+        base_dir = ora_dir
+      )
+      # GLM-ORA (no covariates for Taylor - external cohort)
+      run_glm_ora_analysis_re(
+        te_data = te_taylor_re_subtype,
+        group_col = "tumor_type_subclass",
+        groups = valid_subtypes,
+        analysis_name = "taylor_subtype",
+        base_dir = glm_ora_dir,
+        covariates = NULL
+      )
+      # GLM-GSEA
+      run_glm_gsea_analysis_re(
+        te_data = te_taylor_re_subtype,
+        group_col = "tumor_type_subclass",
+        groups = valid_subtypes,
+        analysis_name = "taylor_subtype",
+        base_dir = glm_gsea_dir,
+        covariates = NULL
+      )
+    } else {
+      cat("Not enough subtypes with >= 3 samples. Skipping.\n")
+    }
+  } else {
+    cat("tumor_type_subclass column not found in te_taylor_re_split_t\n")
+  }
+} else {
+  cat("te_taylor_re_split_t not available for Taylor subtype analysis\n")
+}
+
+#### SAVE RE DATA FOR RE-RNA SCRIPT ####
+cat("\n===== SAVING RE DATA =====\n")
+
+# Save RE preprocessed data for use by RE-RNA script
+re_files_dir <- paste0(re_dir, "files/")
+dir.create(re_files_dir, showWarnings = FALSE, recursive = TRUE)
+
+saveRDS(re_aff_preprocessed, paste0(re_files_dir, "re_aff_preprocessed.rds"))
+saveRDS(re_lfs_preprocessed, paste0(re_files_dir, "re_lfs_preprocessed.rds"))
+saveRDS(re_kics_preprocessed, paste0(re_files_dir, "re_kics_preprocessed.rds"))
+saveRDS(te_aff_re_split_t, paste0(re_files_dir, "te_aff_re_split_t.rds"))
+saveRDS(te_kics_re_split_t, paste0(re_files_dir, "te_kics_re_split_t.rds"))
+saveRDS(te_lfs_re_split_t, paste0(re_files_dir, "te_lfs_re_split_t.rds"))
+if (!is.null(te_taylor_re_split_t) && nrow(te_taylor_re_split_t) > 0) {
+  saveRDS(re_taylor_preprocessed, paste0(re_files_dir, "re_taylor_preprocessed.rds"))
+  saveRDS(te_taylor_re_split_t, paste0(re_files_dir, "te_taylor_re_split_t.rds"))
+}
+cat("Saved RE preprocessed data for RE-RNA script\n")
+
+#### SUMMARY ####
+write_output(quote(NULL), "RE Pathway Analysis Summary")
+
+cat("Analysis completed for the following datasets:\n")
+cat("  1. TP53 status (Simple ORA, GLM-ORA, GLM-GSEA)\n")
+cat("  2. TP53 3-level (Simple ORA, GLM-ORA, GLM-GSEA with LRT + emmeans)\n")
+cat("  3. KICS by tumor type (Simple ORA, GLM-ORA, GLM-GSEA with LRT + emmeans)\n")
+cat("  4. KICS by ancestry (Simple ORA, GLM-ORA, GLM-GSEA with LRT + emmeans)\n")
+cat("  5. LFS by cohort (Simple ORA, GLM-ORA, GLM-GSEA with LRT + emmeans)\n")
+cat("  6. Taylor by subtype (Simple ORA, GLM-ORA, GLM-GSEA with LRT + emmeans)\n\n")
+
+cat("Analysis types:\n")
+cat("  - ora/: Simple ORA (minsample filter only, no GLM)\n")
+cat("  - glm_ora/: GLM-based ORA (with covariates, gene filtering by qgene)\n")
+cat("  - glm_gsea/: GLM-based GSEA (z-statistic ranking)\n\n")
+
+cat("Databases used:", paste(DATABASES_TO_RUN, collapse = ", "), "\n")
+cat("Min samples:", paste(MIN_SAMPLES_VALUES, collapse = ", "), "\n")
+cat("Q-gene thresholds (GLM-ORA only):", paste(Q_GENE_VALUES, collapse = ", "), "\n")
+cat("Min gene counts (ORA types only):", paste(MIN_GENE_VALUES, collapse = ", "), "\n")
+cat("Q-pathway thresholds:", paste(Q_PATHWAY_VALUES, collapse = ", "), "\n")
+
+cat("\nOutput structure:\n")
+cat("  ora/{analysis}/{db}/: Simple ORA plots\n")
+cat("  glm_ora/{analysis}/{db}/: GLM-ORA plots\n")
+cat("  glm_gsea/{analysis}/{db}/: GSEA plots\n")
+cat("Output location:", re_dir, "\n")
+
+# Sort run_summary by analysis_name -> analysis_type -> minsample -> qgene -> mingene -> qpathway
+run_summary <- run_summary %>%
+  arrange(analysis_name, analysis_type, minsample, qgene, mingene, qpathway)
+
+# Save run summary
+run_summary_file <- paste0(re_dir, "RUN_SUMMARY.csv")
+dir.create(paste0(re_dir, "files/"), showWarnings = FALSE, recursive = TRUE)
+write.csv(run_summary, run_summary_file, row.names = FALSE)
+cat("\nSaved run summary:", run_summary_file, "\n")
+
+cat("\nNote: RE-RNA differential expression analysis is in 02_te_viz_tumour_09_re_rna.R\n")
+
+cat("\n Script completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()

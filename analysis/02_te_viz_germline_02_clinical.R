@@ -5,7 +5,11 @@
 
 # Source common setup and load data
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_common_setup.R")
+REQUIRED_DATA <- c("count_matrix", "expand", "split", "clinical", "ancestry", "location")
 source("/Users/briannelaverty/Documents/R_Malkin/te/scripts/viz/00_viz_load_data_germline.R")
+
+# Initialize module-specific text output
+init_module_sink(paste0(plot_dir, "counts_clinical_kics/"), "CLINICAL")
 
 cat("Running 02_te_viz_germline_02_clinical.R...\n")
 
@@ -31,7 +35,7 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), ".pdf\n"))
   titled_print(plots_kruskal_cancer[[i]], paste0("Kruskal plot (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_cancer[[i]], width = 3, height = 5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_cancer[[i]], width = 6, height = 7)
 }
 
 # Generate faceted plots by ancestry
@@ -44,7 +48,7 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry.pdf\n"))
   titled_print(plots_kruskal_cancer_ancestry[[i]], paste0("Kruskal plot faceted by ancestry (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry.pdf"), plot=plots_kruskal_cancer_ancestry[[i]], width = 32, height = 24)
+  ggsave(paste0(plot_dir, "ancestry/te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry.pdf"), plot=plots_kruskal_cancer_ancestry[[i]], width = 32, height = 24)
 }
 
 # Linear model for all types in te_cancer_hostseq
@@ -55,11 +59,11 @@ for (i in seq_along(types)) {
   cat(paste0("\n========================================\n"))
   cat(paste0("  Linear model output (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")\n"))
   cat(paste0("========================================\n"))
-  plots_lm_cancer[[i]] <- plot_count_lm(te_cancer_hostseq, type=types[i], group="cancer_cohort", y_lab=y_label, covariates = covar_med, residuals=FALSE, log_scale=FALSE, x_lab=x_cancer_tp53, min_samples=5, chr=NA)
+  plots_lm_cancer[[i]] <- plot_count_lm(te_cancer_hostseq, type=types[i], group="cancer_cohort", y_lab=y_label, covariates = covar_med, residuals=FALSE, log_scale=FALSE, x_lab=x_cancer_tp53, min_samples=5, chr=NA, fill_palette=color_palette_6)
   cat("\n")
   cat(paste0("Plotting: te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), ".pdf\n"))
   titled_print(plots_lm_cancer[[i]], paste0("Linear model (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_lm_cancer[[i]], width=5, height=5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_lm_cancer[[i]], width=6, height=7)
 }
 
 # Linear model faceted by ancestry
@@ -74,7 +78,45 @@ for (i in seq_along(types)) {
   cat("\n")
   cat(paste0("Plotting: te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry.pdf\n"))
   titled_print(plots_lm_cancer_ancestry[[i]], paste0("Linear model faceted by ancestry (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry.pdf"), plot=plots_lm_cancer_ancestry[[i]], width=32, height=24)
+  ggsave(paste0(plot_dir, "ancestry/te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry.pdf"), plot=plots_lm_cancer_ancestry[[i]], width=32, height=24)
+}
+
+# COMMON TEs - ancestry faceted plots
+if (PROCESS_COMMON_TES) {
+  cat("\n=== COMMON TEs - Ancestry Faceted Plots ===\n")
+
+  # Create common TE cancer_hostseq dataset
+  te_cancer_hostseq_common <- te_all_common %>%
+    filter(cohort == "HostSeq") %>%
+    bind_rows(te_aff_common)
+
+  # Generate faceted Kruskal plots by ancestry for common TEs
+  cat("Plotting common TEs with kruskal faceted by ancestry\n")
+  plots_kruskal_cancer_ancestry_common <- vector("list", length(types))
+  for (i in seq_along(types)) {
+    plots_kruskal_cancer_ancestry_common[[i]] <- write_output(
+      quote(plot_count_kruskal_facet_ancestry(te_cancer_hostseq_common, type=types[i], log_scale=FALSE, group="cancer_cohort", x_lab=x_cancer_tp53, y_lab="Repeat frequency", chr=NA)),
+      paste0("Kruskal plot output faceted by ancestry - COMMON TEs (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")")
+    )
+    cat(paste0("Plotting: te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry_common.pdf\n"))
+    titled_print(plots_kruskal_cancer_ancestry_common[[i]], paste0("Kruskal plot faceted by ancestry - COMMON TEs (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
+    ggsave(paste0(plot_dir, "ancestry/te_count_cancer_cluster_all_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry_common.pdf"), plot=plots_kruskal_cancer_ancestry_common[[i]], width = 32, height = 24)
+  }
+
+  # Generate faceted LM plots by ancestry for common TEs
+  cat("Plotting linear model for common TEs faceted by ancestry\n")
+  plots_lm_cancer_ancestry_common <- vector("list", length(types))
+  for (i in seq_along(types)) {
+    y_label <- ifelse(is.na(types[i]), "Total TE count", paste0(types[i], " count"))
+    cat(paste0("\n========================================\n"))
+    cat(paste0("  Linear model output faceted by ancestry - COMMON TEs (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")\n"))
+    cat(paste0("========================================\n"))
+    plots_lm_cancer_ancestry_common[[i]] <- plot_count_lm_facet_ancestry(te_cancer_hostseq_common, type=types[i], group="cancer_cohort", y_lab=y_label, covariates = covar_med, residuals=FALSE, log_scale=FALSE, x_lab=x_cancer_tp53, min_samples=5, chr=NA)
+    cat("\n")
+    cat(paste0("Plotting: te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry_common.pdf\n"))
+    titled_print(plots_lm_cancer_ancestry_common[[i]], paste0("Linear model faceted by ancestry - COMMON TEs (cancer cohort, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
+    ggsave(paste0(plot_dir, "ancestry/te_count_lm_cancer_hostseq_", ifelse(is.na(types[i]), "all", types[i]), "_ancestry_common.pdf"), plot=plots_lm_cancer_ancestry_common[[i]], width=32, height=24)
+  }
 }
 
 # affected
@@ -87,7 +129,7 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_wilcox_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf\n"))
   titled_print(plots_wilcox_aff[[i]], paste0("Wilcoxon plot (affected, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_wilcox_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_wilcox_aff[[i]], width = 3, height = 5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_wilcox_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_wilcox_aff[[i]], width = 3, height = 5)
 }
 
 # Linear model for all types in te_aff
@@ -101,7 +143,7 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_lm_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf\n"))
   titled_print(plots_lm_aff[[i]], paste0("Linear model (affected, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_lm_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_lm_aff[[i]], width=5, height=5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_lm_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_lm_aff[[i]], width=5, height=5)
 }
 
 # Bootstrap for all types in te_aff (returns two plots)
@@ -110,10 +152,10 @@ for (t in types) {
   boot_res <- bootstrap_test(te_aff, "TP53_status", ifelse(is.na(t), "total", t), mean, n_bootstraps = 10000, step_size=100)
   cat(paste0("\n===== Plotting: te_count_bootstrap_aff_dist_", ifelse(is.na(t), "all", t), ".pdf =====\n"))
   titled_print(boot_res$dist_plot, paste0("Bootstrap test (affected, type=", ifelse(is.na(t), "all", t), ") - Distribution Plot"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_bootstrap_aff_dist_", ifelse(is.na(t), "all", t), ".pdf"), plot=boot_res$dist_plot, width=3, height=5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_bootstrap_aff_dist_", ifelse(is.na(t), "all", t), ".pdf"), plot=boot_res$dist_plot, width=3, height=5)
   cat(paste0("\n===== Plotting: te_count_bootstrap_aff_pval_", ifelse(is.na(t), "all", t), ".pdf =====\n"))
   titled_print(boot_res$pval_plot, paste0("Bootstrap test (affected, type=", ifelse(is.na(t), "all", t), ") - P-value Convergence Plot"))
-  ggsave(paste0(plot_dir, "counts_cohort/te_count_bootstrap_aff_pval_", ifelse(is.na(t), "all", t), ".pdf"), plot=boot_res$pval_plot, width=3, height=5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_bootstrap_aff_pval_", ifelse(is.na(t), "all", t), ".pdf"), plot=boot_res$pval_plot, width=3, height=5)
 }
 
 #### CANCER STATUS COMPARISON (Affected vs Unaffected) ####
@@ -174,7 +216,7 @@ tryCatch({
       theme(legend.position = "none")
 
     print(p_cancer)
-    ggsave(paste0(plot_dir, "counts_cohort/te_count_cancer_status_comparison.pdf"),
+    ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_cancer_status_comparison.pdf"),
            plot = p_cancer, width = 6, height = 5)
 
     # Test by TE type
@@ -200,7 +242,7 @@ tryCatch({
     # Adjust p-values
     cancer_type_results$p_adj <- p.adjust(cancer_type_results$p_value, method = "BH")
     write_output(quote(cancer_type_results), "TE type comparison: Affected vs Unaffected")
-    write.csv(cancer_type_results, paste0(r_dir_files, "cancer_status_te_type_comparison.csv"), row.names = FALSE)
+    write.csv(cancer_type_results, paste0(plot_dir, "files/cancer_status_te_type_comparison.csv"), row.names = FALSE)
   }
 
   # Test specific TEs for cancer status (within LFS samples with both affected and unaffected)
@@ -241,7 +283,7 @@ for (i in seq_along(types)) {
     paste0("Kruskal by tumour type (te_aff, type=", ifelse(is.na(types[i]), "all", types[i]), ")")
   )
   titled_print(plots_kruskal_nogroup[[i]], paste0("Kruskal by tumour type (te_aff, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_tumour_type/te_count_tt_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_nogroup[[i]], width = 9, height = 5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_tt_aff_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_nogroup[[i]], width = 9, height = 5)
 }
 
 cat(" Plotting: Kruskal by tumour type (te_kics) \n")
@@ -254,7 +296,7 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_tt_kics_", ifelse(is.na(types[i]), "all", types[i]), ".pdf =====\n"))
   titled_print(plots_kruskal_nogroup_kics[[i]], paste0("Kruskal by tumour type (te_kics, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_tumour_type/te_count_tt_kics_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_nogroup_kics[[i]], width = 9, height = 5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_tt_kics_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_nogroup_kics[[i]], width = 9, height = 5)
 }
 
 cat(" Plotting: Kruskal by tumour type (te_lfs) \n")
@@ -267,7 +309,7 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_tt_lfs_", ifelse(is.na(types[i]), "all", types[i]), ".pdf =====\n"))
   titled_print(plots_kruskal_nogroup_lfs[[i]], paste0("Kruskal by tumour type (te_lfs, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_tumour_type/te_count_tt_lfs_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_nogroup_lfs[[i]], width = 9, height = 5)
+  ggsave(paste0(plot_dir, "counts_clinical_lfs/te_count_tt_lfs_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_nogroup_lfs[[i]], width = 9, height = 5)
 }
 
 # Export top 10% samples by total insertions
@@ -276,7 +318,7 @@ top10_threshold <- quantile(te_aff$total, 0.90, na.rm = TRUE)
 te_aff_top10 <- te_aff %>% filter(total >= top10_threshold)
 cat("Top 10% threshold:", top10_threshold, "\n")
 cat("Number of samples in top 10%:", nrow(te_aff_top10), "\n")
-write.csv(te_aff_top10, paste0(r_dir_files, "te_aff_top10_samples.csv"), row.names = FALSE, quote = FALSE)
+write.csv(te_aff_top10, paste0(plot_dir, "files/te_aff_top10_samples.csv"), row.names = FALSE, quote = FALSE)
 cat("Exported te_aff_top10_samples.csv\n")
 
 # Export outlier samples by tumor type (types with >=3 samples)
@@ -300,7 +342,7 @@ cat("Number of outlier samples:", nrow(outlier_samples), "\n")
 if (nrow(outlier_samples) > 0) {
   cat("Outliers by tumor type:\n")
   print(table(outlier_samples$tumor_type))
-  write.csv(outlier_samples, paste0(r_dir_files, "te_aff_outliers_by_tumor_type.csv"), row.names = FALSE, quote = FALSE)
+  write.csv(outlier_samples, paste0(plot_dir, "files/te_aff_outliers_by_tumor_type.csv"), row.names = FALSE, quote = FALSE)
   cat("Exported te_aff_outliers_by_tumor_type.csv\n")
 } else {
   cat("No outliers detected\n")
@@ -316,32 +358,8 @@ for (i in seq_along(types)) {
   )
   cat(paste0("Plotting: te_count_tt_aff_tp53_", ifelse(is.na(types[i]), "all", types[i]), ".pdf =====\n"))
   titled_print(plots_tt_group[[i]], paste0("TE count by tumour type and TP53 group (te_aff, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
-  ggsave(paste0(plot_dir, "counts_tumour_type/te_count_tt_aff_tp53_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_tt_group[[i]], width = 9, height = 5)
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_tt_aff_tp53_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_tt_group[[i]], width = 9, height = 5)
 }
-
-# specific te by tumour type
-cat("Performing Fisher's test by tumour type \n")
-specific_te_tt <- write_output(
-  quote(as.data.frame(fisher_test_by_tumor_type(te_aff_expand, min_samples_tt=10, min_samples_te=5))),
-  "Fisher test by tumour type (te_aff_expand)"
-)
-write_output(quote(print(head(specific_te_tt))), "Head of specific_te_tt")
-
-# samples with significant TE
-cat("Filtering significant TEs by tumour type\n")
-specific_te_tt_sig <- specific_te_tt %>% filter(fisher_p_value_BH < 0.05)
-
-# Get contingency tables in long format for CSV export
-sig_te_tt_tables_long <- write_output(
-  quote(get_sig_te_contingency_tables_long(te_aff_expand, specific_te_tt_sig, min_samples_tt=10)),
-  "Contingency tables for significant TE by tumour type (te_aff_expand)"
-)
-
-# Save results to files directory
-write.csv(specific_te_tt_sig, paste0(r_dir_files, "specific_te_tt_sig.csv"), row.names=FALSE)
-write.csv(sig_te_tt_tables_long, paste0(r_dir_files, "specific_te_tt_table.csv"), row.names=FALSE)
-cat("Saved specific_te_tt_sig.csv and specific_te_tt_table.csv\n")
-
 
 #### COUNT BY CLINICAL VARIABLES ####
 # by cluster
@@ -391,6 +409,37 @@ for (i in seq_along(types)) {
   )
   titled_print(plots_kruskal_varclass[[i]], paste0("Kruskal by variant classification (te_lfs, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
   ggsave(paste0(plot_dir, "counts_clinical_lfs/te_count_lfs_varclass_", ifelse(is.na(types[i]), "all", types[i]), ".pdf"), plot=plots_kruskal_varclass[[i]], width = 9, height = 5)
+}
+
+#### COUNT PER CHROMOSOME ####
+cat("\n===== COUNT PER CHROMOSOME =====\n")
+for (i in seq_along(types)) {
+  write_output(quote(plot_count_perchr_notest(te_kics, type=types[i], y_lab="Total TE count normalized by chromosome length", log_scale=FALSE)),
+               paste0("Count per chromosome (KICS, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
+  titled_print(plot_count_perchr_notest(te_kics, type=types[i], y_lab="Total TE count normalized by chromosome length", log_scale=FALSE),
+               paste0("Count per chromosome (KICS, type=", ifelse(is.na(types[i]), "all", types[i]), ")"))
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_perchr_kics_", ifelse(is.na(types[i]), "all", types[i]), ".png"), width = 9, height = 5)
+}
+
+cat("\n===== COUNT PER CHROMOSOME BY TP53 STATUS =====\n")
+for (i in seq_along(types)) {
+  write_output(quote(plot_count_perchr(te_aff, type=types[i], group="TP53_status", y_lab="TE count normalized by chromosome length")),
+               paste0("Count per chromosome (affected, type=", ifelse(is.na(types[i]), "all", types[i]), ", by TP53_status)"))
+  titled_print(plot_count_perchr(te_aff, type=types[i], group="TP53_status", y_lab="TE count normalized by chromosome length"),
+               paste0("Count per chromosome (affected, type=", ifelse(is.na(types[i]), "all", types[i]), ", by TP53_status)"))
+  ggsave(paste0(plot_dir, "counts_clinical_kics/te_count_perchr_aff_tp53_", ifelse(is.na(types[i]), "all", types[i]), ".png"),
+         plot=plot_count_perchr(te_aff, type=types[i], group="TP53_status", y_lab="TE count normalized by chromosome length"), width=9, height=5)
+}
+
+# By Cancer (LFS)
+cat("\n===== COUNT PER CHROMOSOME BY CANCER STATUS =====\n")
+for (i in seq_along(types)) {
+  write_output(quote(plot_count_perchr(te_lfs, type=types[i], group="Cancer", y_lab="TE count normalized by chromosome length")),
+               paste0("Count per chromosome (LFS, type=", ifelse(is.na(types[i]), "all", types[i]), ", by Cancer)"))
+  titled_print(plot_count_perchr(te_lfs, type=types[i], group="Cancer", y_lab="TE count normalized by chromosome length"),
+               paste0("Count per chromosome (LFS, type=", ifelse(is.na(types[i]), "all", types[i]), ", by Cancer)"))
+  ggsave(paste0(plot_dir, "counts_clinical_lfs/te_count_perchr_lfs_cancer_", ifelse(is.na(types[i]), "all", types[i]), ".png"),
+         plot=plot_count_perchr(te_lfs, type=types[i], group="Cancer", y_lab="TE count normalized by chromosome length"), width=9, height=5)
 }
 
 # count by age
@@ -559,4 +608,211 @@ p_lm_ancestry_mapped <- write_output(
 titled_print(p_lm_ancestry_mapped, "Linear model by mapped label (te_aff, all types, log scale)")
 ggsave(paste0(plot_dir, "ancestry/te_count_lm_mapped_label_aff_all.png"), plot=p_lm_ancestry_mapped, width = 9, height = 5)
 
+# COMMON TEs - mapped label plot
+if (PROCESS_COMMON_TES) {
+  cat("\n=== COMMON TEs - Mapped Label Plot ===\n")
+
+  # Plot count LM grouped by mapped_label for common TEs
+  mapped_label_palette_common <- scales::hue_pal()(length(unique(te_aff_common$mapped_label[!is.na(te_aff_common$mapped_label)])))
+
+  p_lm_ancestry_mapped_common <- write_output(
+    quote(plot_count_lm(te_aff_common, min_samples=5, residuals=FALSE, group="mapped_label",
+                        log_scale=FALSE, covariates = covar_med, x_lab="Mapped Label",
+                        y_lab="Total TE count", type=NA, chr=NA, fill_palette=mapped_label_palette_common)),
+    "Linear model by mapped label - COMMON TEs (te_aff_common, all types)"
+  )
+  titled_print(p_lm_ancestry_mapped_common, "Linear model by mapped label - COMMON TEs (te_aff_common, all types)")
+  ggsave(paste0(plot_dir, "ancestry/te_count_lm_mapped_label_aff_all_common.png"), plot=p_lm_ancestry_mapped_common, width = 9, height = 5)
+}
+
+# ========================================
+# HOSTSEQ DATASET - Ancestry Plots
+# ========================================
+
+cat("\n=== HOSTSEQ - Ancestry Plots (Rare TEs) ===\n")
+
+# Define covariates for HostSeq (exclude tumor_type and predicted_ancestry_thres)
+covar_hostseq <- c("med_cov", "total_reads", "med_read_len", "pct_chimeras", "avg_quality")
+
+# LM by predicted_ancestry_thres for HostSeq
+ancestry_palette_hostseq <- scales::hue_pal()(length(unique(te_hostseq$predicted_ancestry_thres[!is.na(te_hostseq$predicted_ancestry_thres)])))
+
+p_lm_ancestry_pred_hostseq <- write_output(
+  quote(plot_count_lm(te_hostseq, min_samples=5, residuals=FALSE, group="predicted_ancestry_thres",
+                      log_scale=TRUE, covariates = covar_hostseq, x_lab="Predicted Ancestry",
+                      y_lab="Total TE count", type=NA, chr=NA, fill_palette=ancestry_palette_hostseq)),
+  "Linear model by predicted ancestry - HostSeq (all types, log scale)"
+)
+titled_print(p_lm_ancestry_pred_hostseq, "Linear model by predicted ancestry - HostSeq (all types, log scale)")
+ggsave(paste0(plot_dir, "ancestry/te_count_lm_predicted_ancestry_thres_hostseq_all.png"), plot=p_lm_ancestry_pred_hostseq, width = 9, height = 5)
+
+# LM by mapped_label for HostSeq
+mapped_label_palette_hostseq <- scales::hue_pal()(length(unique(te_hostseq$mapped_label[!is.na(te_hostseq$mapped_label)])))
+
+p_lm_ancestry_mapped_hostseq <- write_output(
+  quote(plot_count_lm(te_hostseq, min_samples=5, residuals=FALSE, group="mapped_label",
+                      log_scale=TRUE, covariates = covar_hostseq, x_lab="Mapped Label",
+                      y_lab="Total TE count", type=NA, chr=NA, fill_palette=mapped_label_palette_hostseq)),
+  "Linear model by mapped label - HostSeq (all types, log scale)"
+)
+titled_print(p_lm_ancestry_mapped_hostseq, "Linear model by mapped label - HostSeq (all types, log scale)")
+ggsave(paste0(plot_dir, "ancestry/te_count_lm_mapped_label_hostseq_all.png"), plot=p_lm_ancestry_mapped_hostseq, width = 9, height = 5)
+
+# HOSTSEQ COMMON TEs
+if (PROCESS_COMMON_TES) {
+  cat("\n=== HOSTSEQ - Ancestry Plots (Common TEs) ===\n")
+
+  # LM by predicted_ancestry_thres for HostSeq common
+  ancestry_palette_hostseq_common <- scales::hue_pal()(length(unique(te_hostseq_common$predicted_ancestry_thres[!is.na(te_hostseq_common$predicted_ancestry_thres)])))
+
+  p_lm_ancestry_pred_hostseq_common <- write_output(
+    quote(plot_count_lm(te_hostseq_common, min_samples=5, residuals=FALSE, group="predicted_ancestry_thres",
+                        log_scale=FALSE, covariates = covar_hostseq, x_lab="Predicted Ancestry",
+                        y_lab="Total TE count", type=NA, chr=NA, fill_palette=ancestry_palette_hostseq_common)),
+    "Linear model by predicted ancestry - HostSeq COMMON (all types)"
+  )
+  titled_print(p_lm_ancestry_pred_hostseq_common, "Linear model by predicted ancestry - HostSeq COMMON (all types)")
+  ggsave(paste0(plot_dir, "ancestry/te_count_lm_predicted_ancestry_thres_hostseq_all_common.png"), plot=p_lm_ancestry_pred_hostseq_common, width = 9, height = 5)
+
+  # LM by mapped_label for HostSeq common
+  mapped_label_palette_hostseq_common <- scales::hue_pal()(length(unique(te_hostseq_common$mapped_label[!is.na(te_hostseq_common$mapped_label)])))
+
+  p_lm_ancestry_mapped_hostseq_common <- write_output(
+    quote(plot_count_lm(te_hostseq_common, min_samples=5, residuals=FALSE, group="mapped_label",
+                        log_scale=FALSE, covariates = covar_hostseq, x_lab="Mapped Label",
+                        y_lab="Total TE count", type=NA, chr=NA, fill_palette=mapped_label_palette_hostseq_common)),
+    "Linear model by mapped label - HostSeq COMMON (all types)"
+  )
+  titled_print(p_lm_ancestry_mapped_hostseq_common, "Linear model by mapped label - HostSeq COMMON (all types)")
+  ggsave(paste0(plot_dir, "ancestry/te_count_lm_mapped_label_hostseq_all_common.png"), plot=p_lm_ancestry_mapped_hostseq_common, width = 9, height = 5)
+}
+
+# ========================================
+# TAYLOR DATASET - Ancestry Plots
+# ========================================
+
+cat("\n=== TAYLOR - Ancestry Plots (Rare TEs) ===\n")
+
+# Define covariates for Taylor (exclude tumor_type and predicted_ancestry_thres)
+covar_taylor <- c("med_cov", "total_reads", "med_read_len", "pct_chimeras", "avg_quality")
+
+# LM by predicted_ancestry_thres for Taylor
+ancestry_palette_taylor <- scales::hue_pal()(length(unique(te_taylor$predicted_ancestry_thres[!is.na(te_taylor$predicted_ancestry_thres)])))
+
+p_lm_ancestry_pred_taylor <- write_output(
+  quote(plot_count_lm(te_taylor, min_samples=5, residuals=FALSE, group="predicted_ancestry_thres",
+                      log_scale=TRUE, covariates = covar_taylor, x_lab="Predicted Ancestry",
+                      y_lab="Total TE count", type=NA, chr=NA, fill_palette=ancestry_palette_taylor)),
+  "Linear model by predicted ancestry - Taylor (all types, log scale)"
+)
+titled_print(p_lm_ancestry_pred_taylor, "Linear model by predicted ancestry - Taylor (all types, log scale)")
+ggsave(paste0(plot_dir, "ancestry/te_count_lm_predicted_ancestry_thres_taylor_all.png"), plot=p_lm_ancestry_pred_taylor, width = 9, height = 5)
+
+# LM by mapped_label for Taylor
+mapped_label_palette_taylor <- scales::hue_pal()(length(unique(te_taylor$mapped_label[!is.na(te_taylor$mapped_label)])))
+
+p_lm_ancestry_mapped_taylor <- write_output(
+  quote(plot_count_lm(te_taylor, min_samples=5, residuals=FALSE, group="mapped_label",
+                      log_scale=TRUE, covariates = covar_taylor, x_lab="Mapped Label",
+                      y_lab="Total TE count", type=NA, chr=NA, fill_palette=mapped_label_palette_taylor)),
+  "Linear model by mapped label - Taylor (all types, log scale)"
+)
+titled_print(p_lm_ancestry_mapped_taylor, "Linear model by mapped label - Taylor (all types, log scale)")
+ggsave(paste0(plot_dir, "ancestry/te_count_lm_mapped_label_taylor_all.png"), plot=p_lm_ancestry_mapped_taylor, width = 9, height = 5)
+
+# TAYLOR COMMON TEs
+if (PROCESS_COMMON_TES) {
+  cat("\n=== TAYLOR - Ancestry Plots (Common TEs) ===\n")
+
+  # LM by predicted_ancestry_thres for Taylor common
+  ancestry_palette_taylor_common <- scales::hue_pal()(length(unique(te_taylor_common$predicted_ancestry_thres[!is.na(te_taylor_common$predicted_ancestry_thres)])))
+
+  p_lm_ancestry_pred_taylor_common <- write_output(
+    quote(plot_count_lm(te_taylor_common, min_samples=5, residuals=FALSE, group="predicted_ancestry_thres",
+                        log_scale=FALSE, covariates = covar_taylor, x_lab="Predicted Ancestry",
+                        y_lab="Total TE count", type=NA, chr=NA, fill_palette=ancestry_palette_taylor_common)),
+    "Linear model by predicted ancestry - Taylor COMMON (all types)"
+  )
+  titled_print(p_lm_ancestry_pred_taylor_common, "Linear model by predicted ancestry - Taylor COMMON (all types)")
+  ggsave(paste0(plot_dir, "ancestry/te_count_lm_predicted_ancestry_thres_taylor_all_common.png"), plot=p_lm_ancestry_pred_taylor_common, width = 9, height = 5)
+
+  # LM by mapped_label for Taylor common
+  mapped_label_palette_taylor_common <- scales::hue_pal()(length(unique(te_taylor_common$mapped_label[!is.na(te_taylor_common$mapped_label)])))
+
+  p_lm_ancestry_mapped_taylor_common <- write_output(
+    quote(plot_count_lm(te_taylor_common, min_samples=5, residuals=FALSE, group="mapped_label",
+                        log_scale=FALSE, covariates = covar_taylor, x_lab="Mapped Label",
+                        y_lab="Total TE count", type=NA, chr=NA, fill_palette=mapped_label_palette_taylor_common)),
+    "Linear model by mapped label - Taylor COMMON (all types)"
+  )
+  titled_print(p_lm_ancestry_mapped_taylor_common, "Linear model by mapped label - Taylor COMMON (all types)")
+  ggsave(paste0(plot_dir, "ancestry/te_count_lm_mapped_label_taylor_all_common.png"), plot=p_lm_ancestry_mapped_taylor_common, width = 9, height = 5)
+}
+
+#### LFS TE COUNT BY TUMOR TYPE - COLORED BY COHORT ####
+cat("\n========================================\n")
+cat("LFS TE COUNT BY TUMOR TYPE - COLORED BY COHORT\n")
+cat("========================================\n\n")
+
+# Use te_lfs - filter to samples with valid cohort and tumor_type
+# Exclude HostSeq and Taylor (not LFS clinical), keep only tumor types with at least 3 total samples
+te_lfs_valid <- te_lfs %>%
+  filter(!is.na(cohort), !is.na(tumor_type), !cohort %in% c("HostSeq", "Taylor")) %>%
+  group_by(tumor_type) %>%
+  filter(n() >= 3) %>%
+  ungroup()
+
+cat("Total samples:", nrow(te_lfs_valid), "\n")
+cat("Cohort distribution:\n")
+print(table(te_lfs_valid$cohort))
+cat("\nTumor types (>=3 samples):", paste(unique(te_lfs_valid$tumor_type), collapse=", "), "\n")
+
+# Get unique cohorts for color palette
+cohorts <- unique(te_lfs_valid$cohort)
+n_cohorts <- length(cohorts)
+
+# Create color palette based on number of cohorts
+if (n_cohorts == 2) {
+  cohort_colors <- c("#E41A1C", "#377EB8")
+  cohort_shapes <- c(16, 17)
+} else {
+  cohort_colors <- scales::hue_pal()(n_cohorts)
+  cohort_shapes <- rep(c(16, 17, 15, 18), length.out = n_cohorts)
+}
+names(cohort_colors) <- cohorts
+names(cohort_shapes) <- cohorts
+
+for (i in seq_along(types)) {
+  type_label <- ifelse(is.na(types[i]), "all", types[i])
+  y_label <- ifelse(is.na(types[i]), "Repeat count", paste0(types[i], " count"))
+  count_col <- ifelse(is.na(types[i]), "total", types[i])
+
+  cat("\n--- Type:", type_label, "---\n")
+
+  tryCatch({
+    # Custom plot: separate boxplots per cohort for each tumor type
+    p <- ggplot(te_lfs_valid, aes(x = tumor_type, y = .data[[count_col]], fill = cohort)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(aes(color = cohort, shape = cohort),
+                  position = position_jitterdodge(jitter.width = 0.2), size = 2.5, alpha = 0.8) +
+      scale_y_log10() +
+      scale_fill_manual(values = cohort_colors) +
+      scale_color_manual(values = cohort_colors) +
+      scale_shape_manual(values = cohort_shapes) +
+      labs(x = "Tumor type", y = y_label, fill = "Cohort", color = "Cohort", shape = "Cohort") +
+      guides(color = "none", shape = "none") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+    titled_print(p, paste0("Germline LFS TE by tumor type & cohort (type=", type_label, ")"))
+    ggsave(paste0(plot_dir, "counts_clinical_lfs/te_count_tt_lfs_cohort_", type_label, ".png"),
+           plot=p, width=10, height=6)
+    cat("Saved: te_count_tt_lfs_cohort_", type_label, ".png\n")
+  }, error = function(e) {
+    cat("Error:", e$message, "\n")
+  })
+}
+
 cat("✓ Clinical associations completed successfully\n")
+
+# Close module-specific sink
+close_module_sink()
