@@ -1,6 +1,8 @@
 data/
 logs/
 .DS_Store
+*.rds
+root/
 te_discovery/.snakemake
 *.out
 
